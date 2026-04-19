@@ -14,29 +14,53 @@
     <a class="site-title d-block" href="{{ '/' | relative_url }}">{{ site.title }}</a>
     <p class="site-subtitle fst-italic mb-0">{{ site.tagline }}</p>
 
-    {%- comment -%} Language toggle (jekyll-polyglot) {%- endcomment -%}
+    {%- comment -%}
+      Language toggle (jekyll-polyglot).
+      Rendered client-side because polyglot rewrites href attributes at
+      build time (even absolute URLs matching site.url), so any link we
+      emit here would get re-prefixed with the active language.
+    {%- endcomment -%}
     {%- if site.languages and site.languages.size > 1 -%}
-      {%- assign active_lang = site.active_lang | default: site.default_lang -%}
-      {%- if active_lang != site.default_lang -%}
-        {%- assign lang_prefix = '/' | append: active_lang -%}
-        {%- assign base_path = page.url | remove_first: lang_prefix -%}
-      {%- else -%}
-        {%- assign base_path = page.url -%}
-      {%- endif -%}
-      <div class="lang-toggle mt-2 d-flex justify-content-center" style="gap: 0.35rem; font-size: 0.75rem;">
-        {%- for lang in site.languages -%}
-          {%- if lang == site.default_lang -%}
-            {%- assign target = site.url | append: site.baseurl | append: base_path -%}
-          {%- else -%}
-            {%- assign target = site.url | append: site.baseurl | append: '/' | append: lang | append: base_path -%}
-          {%- endif -%}
-          {%- if lang == active_lang -%}
-            <span aria-current="page" style="padding: 0.1rem 0.5rem; border-radius: 999px; background: var(--btn-bg, rgba(128,128,128,0.25)); color: var(--text-color); font-weight: 600; letter-spacing: 0.05em;">{{ lang | upcase }}</span>
-          {%- else -%}
-            <a href="{{ target }}" style="padding: 0.1rem 0.5rem; border-radius: 999px; border: 1px solid var(--sidebar-border-color, rgba(128,128,128,0.3)); color: var(--sidebar-muted-color, var(--text-muted-color)); text-decoration: none; letter-spacing: 0.05em;">{{ lang | upcase }}</a>
-          {%- endif -%}
-        {%- endfor -%}
-      </div>
+      <div id="lang-toggle" class="mt-2 d-flex justify-content-center" style="gap: 0.35rem; font-size: 0.75rem;"
+           data-default-lang="{{ site.default_lang }}"
+           data-languages="{{ site.languages | join: ',' }}"
+           data-baseurl="{{ site.baseurl }}"></div>
+      <script>
+        (function () {
+          var root = document.getElementById('lang-toggle');
+          if (!root) return;
+          var defaultLang = root.dataset.defaultLang;
+          var langs = root.dataset.languages.split(',');
+          var baseurl = root.dataset.baseurl || '';
+          var path = location.pathname;
+          if (baseurl && path.indexOf(baseurl) === 0) path = path.slice(baseurl.length) || '/';
+          var langPattern = new RegExp('^\\/(' + langs.join('|') + ')(\\/|$)');
+          var m = path.match(langPattern);
+          var currentLang = defaultLang;
+          var basePath = path;
+          if (m && m[1] !== defaultLang) {
+            currentLang = m[1];
+            basePath = path.slice(('/' + m[1]).length) || '/';
+          }
+          var activeStyle = 'padding:0.1rem 0.5rem;border-radius:999px;background:var(--btn-bg,rgba(128,128,128,0.25));color:var(--text-color);font-weight:600;letter-spacing:0.05em;';
+          var linkStyle = 'padding:0.1rem 0.5rem;border-radius:999px;border:1px solid var(--sidebar-border-color,rgba(128,128,128,0.3));color:var(--sidebar-muted-color,var(--text-muted-color));text-decoration:none;letter-spacing:0.05em;';
+          langs.forEach(function (lang) {
+            var target = baseurl + (lang === defaultLang ? '' : '/' + lang) + basePath;
+            var el;
+            if (lang === currentLang) {
+              el = document.createElement('span');
+              el.setAttribute('aria-current', 'page');
+              el.style.cssText = activeStyle;
+            } else {
+              el = document.createElement('a');
+              el.setAttribute('href', target);
+              el.style.cssText = linkStyle;
+            }
+            el.textContent = lang.toUpperCase();
+            root.appendChild(el);
+          });
+        })();
+      </script>
     {%- endif -%}
   </header>
   <!-- .profile-wrapper -->
