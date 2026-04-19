@@ -1,20 +1,21 @@
 {%- comment -%}
-  Renders a language switcher linking to the same post in other languages.
-  Requires each post to set `lang` and `ref` in its front matter.
-  Pair posts by giving them the same `ref`.
+  Renders a language switcher for the current post.
+  Requires each paired post to share the same `permalink` in front matter.
+  Non-default languages are automatically served under /<lang>/<permalink>.
 {%- endcomment -%}
 
-{%- assign current_ref = page.ref -%}
-{%- if current_ref -%}
+{%- if page.permalink -%}
 <div class="lang-switcher" style="margin: 1rem 0; display: flex; gap: 0.5rem; flex-wrap: wrap;">
   {%- for lang in site.languages -%}
-    {%- assign match = site.posts | where: "ref", current_ref | where: "lang", lang | first -%}
-    {%- if match -%}
-      {%- if lang == page.lang -%}
-        <span class="lang-current" style="padding: 0.25rem 0.6rem; border-radius: 0.25rem; background: var(--label-color, #eee); font-weight: 600;">{{ lang | upcase }}</span>
-      {%- else -%}
-        <a class="lang-link" href="{{ match.url | relative_url }}" style="padding: 0.25rem 0.6rem; border-radius: 0.25rem; border: 1px solid var(--main-border-color, #ccc);">{{ lang | upcase }}</a>
-      {%- endif -%}
+    {%- if lang == site.default_lang -%}
+      {%- assign target_url = page.permalink -%}
+    {%- else -%}
+      {%- assign target_url = '/' | append: lang | append: page.permalink -%}
+    {%- endif -%}
+    {%- if lang == page.lang -%}
+      <span class="lang-current" style="padding: 0.25rem 0.6rem; border-radius: 0.25rem; background: var(--label-color, #eee); font-weight: 600;">{{ lang | upcase }}</span>
+    {%- else -%}
+      <a class="lang-link" href="{{ target_url | relative_url }}" style="padding: 0.25rem 0.6rem; border-radius: 0.25rem; border: 1px solid var(--main-border-color, #ccc);">{{ lang | upcase }}</a>
     {%- endif -%}
   {%- endfor -%}
 </div>
