@@ -13,6 +13,31 @@
 
     <a class="site-title d-block" href="{{ '/' | relative_url }}">{{ site.title }}</a>
     <p class="site-subtitle fst-italic mb-0">{{ site.tagline }}</p>
+
+    {%- comment -%} Language toggle (jekyll-polyglot) {%- endcomment -%}
+    {%- if site.languages and site.languages.size > 1 -%}
+      {%- assign active_lang = site.active_lang | default: site.default_lang -%}
+      {%- if active_lang != site.default_lang -%}
+        {%- assign lang_prefix = '/' | append: active_lang -%}
+        {%- assign base_path = page.url | remove_first: lang_prefix -%}
+      {%- else -%}
+        {%- assign base_path = page.url -%}
+      {%- endif -%}
+      <div class="lang-toggle mt-2 d-flex justify-content-center" style="gap: 0.35rem; font-size: 0.75rem;">
+        {%- for lang in site.languages -%}
+          {%- if lang == site.default_lang -%}
+            {%- assign target = site.baseurl | append: base_path -%}
+          {%- else -%}
+            {%- assign target = site.baseurl | append: '/' | append: lang | append: base_path -%}
+          {%- endif -%}
+          {%- if lang == active_lang -%}
+            <span aria-current="page" style="padding: 0.1rem 0.5rem; border-radius: 999px; background: var(--btn-bg, rgba(128,128,128,0.25)); color: var(--text-color); font-weight: 600; letter-spacing: 0.05em;">{{ lang | upcase }}</span>
+          {%- else -%}
+            <a href="{{ target }}" style="padding: 0.1rem 0.5rem; border-radius: 999px; border: 1px solid var(--sidebar-border-color, rgba(128,128,128,0.3)); color: var(--sidebar-muted-color, var(--text-muted-color)); text-decoration: none; letter-spacing: 0.05em;">{{ lang | upcase }}</a>
+          {%- endif -%}
+        {%- endfor -%}
+      </div>
+    {%- endif -%}
   </header>
   <!-- .profile-wrapper -->
 
@@ -39,31 +64,6 @@
       {% endfor %}
     </ul>
   </nav>
-
-  {%- comment -%} Language toggle (jekyll-polyglot) {%- endcomment -%}
-  {%- if site.languages and site.languages.size > 1 -%}
-    {%- assign active_lang = site.active_lang | default: site.default_lang -%}
-    {%- if active_lang != site.default_lang -%}
-      {%- assign lang_prefix = '/' | append: active_lang -%}
-      {%- assign base_path = page.url | remove_first: lang_prefix -%}
-    {%- else -%}
-      {%- assign base_path = page.url -%}
-    {%- endif -%}
-    <div class="lang-toggle d-flex justify-content-center gap-2 w-100 mb-2">
-      {%- for lang in site.languages -%}
-        {%- if lang == site.default_lang -%}
-          {%- assign target = base_path -%}
-        {%- else -%}
-          {%- assign target = '/' | append: lang | append: base_path -%}
-        {%- endif -%}
-        {%- if lang == active_lang -%}
-          <span class="btn btn-sm btn-secondary disabled" aria-current="page">{{ lang | upcase }}</span>
-        {%- else -%}
-          <a class="btn btn-sm btn-outline-secondary" href="{{ target | relative_url }}">{{ lang | upcase }}</a>
-        {%- endif -%}
-      {%- endfor -%}
-    </div>
-  {%- endif -%}
 
   <div class="sidebar-bottom d-flex flex-wrap  align-items-center w-100">
     {% unless site.theme_mode %}
