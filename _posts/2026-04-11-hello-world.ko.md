@@ -8,8 +8,6 @@ ref: hello-world
 permalink: /posts/hello-world/
 ---
 
-{% include lang-switcher.html %}
-
 테스트
 
 ## 코드
