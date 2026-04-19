@@ -40,88 +40,19 @@
     </ul>
   </nav>
 
-  {%- comment -%}
-    Language toggle (jekyll-polyglot).
-    Rendered client-side because polyglot rewrites href attributes at
-    build time (including absolute URLs matching site.url), so any link
-    we emit here would get re-prefixed with the active language.
-  {%- endcomment -%}
-  {%- if site.languages and site.languages.size > 1 -%}
-    <div id="lang-toggle" class="d-flex justify-content-center w-100 mb-2" style="gap: 0.5rem; font-size: 0.8rem;"
-         data-default-lang="{{ site.default_lang }}"
-         data-languages="{{ site.languages | join: ',' }}"
-         data-baseurl="{{ site.baseurl }}"></div>
-    <script>
-      (function () {
-        var root = document.getElementById('lang-toggle');
-        if (!root) return;
-        var defaultLang = root.dataset.defaultLang;
-        var langs = root.dataset.languages.split(',');
-        var baseurl = root.dataset.baseurl || '';
-        var STORAGE_KEY = 'preferred-lang';
-        var REDIRECT_FLAG = 'lang-auto-redirected';
-
-        var path = location.pathname;
-        if (baseurl && path.indexOf(baseurl) === 0) path = path.slice(baseurl.length) || '/';
-        var langPattern = new RegExp('^\\/(' + langs.join('|') + ')(\\/|$)');
-        var m = path.match(langPattern);
-        var currentLang = defaultLang;
-        var basePath = path;
-        if (m && m[1] !== defaultLang) {
-          currentLang = m[1];
-          basePath = path.slice(('/' + m[1]).length) || '/';
-        }
-
-        // Auto-redirect first-time visitors based on stored preference or browser language.
-        try {
-          var stored = localStorage.getItem(STORAGE_KEY);
-          var redirected = sessionStorage.getItem(REDIRECT_FLAG);
-          if (!redirected) {
-            var preferred = stored;
-            if (!preferred) {
-              var nav = (navigator.language || navigator.userLanguage || '').toLowerCase();
-              for (var i = 0; i < langs.length; i++) {
-                if (nav === langs[i] || nav.indexOf(langs[i] + '-') === 0) { preferred = langs[i]; break; }
-              }
-            }
-            if (preferred && preferred !== currentLang && langs.indexOf(preferred) !== -1) {
-              sessionStorage.setItem(REDIRECT_FLAG, '1');
-              var dest = baseurl + (preferred === defaultLang ? '' : '/' + preferred) + basePath;
-              location.replace(dest);
-              return;
-            }
-          }
-        } catch (e) { /* storage blocked; fall through */ }
-
-        var activeStyle = 'padding:0.2rem 0.75rem;border-radius:999px;background:var(--btn-bg,rgba(128,128,128,0.3));color:var(--text-color);font-weight:600;letter-spacing:0.05em;';
-        var linkStyle = 'padding:0.2rem 0.75rem;border-radius:999px;border:1px solid var(--sidebar-border-color,rgba(128,128,128,0.35));color:var(--sidebar-muted-color,var(--text-muted-color));text-decoration:none;letter-spacing:0.05em;';
-        langs.forEach(function (lang) {
-          var target = baseurl + (lang === defaultLang ? '' : '/' + lang) + basePath;
-          var el;
-          if (lang === currentLang) {
-            el = document.createElement('span');
-            el.setAttribute('aria-current', 'page');
-            el.style.cssText = activeStyle;
-          } else {
-            el = document.createElement('a');
-            el.setAttribute('href', target);
-            el.style.cssText = linkStyle;
-            el.addEventListener('click', function () {
-              try { localStorage.setItem(STORAGE_KEY, lang); } catch (e) {}
-            });
-          }
-          el.textContent = lang.toUpperCase();
-          root.appendChild(el);
-        });
-      })();
-    </script>
-  {%- endif -%}
-
   <div class="sidebar-bottom d-flex flex-wrap  align-items-center w-100">
     {% unless site.theme_mode %}
       <button type="button" class="btn btn-link nav-link" aria-label="Switch Mode" id="mode-toggle">
         <i class="fas fa-adjust"></i>
       </button>
+
+      {%- if site.languages and site.languages.size > 1 -%}
+        <a id="lang-switch" href="#" aria-label="Switch Language"
+           data-default-lang="{{ site.default_lang }}"
+           data-languages="{{ site.languages | join: ',' }}"
+           data-baseurl="{{ site.baseurl }}"
+           style="display:inline-flex;align-items:center;justify-content:center;width:1.75rem;height:1.75rem;border-radius:50%;border:1px solid currentColor;font-size:0.7rem;font-weight:700;letter-spacing:0.03em;text-decoration:none;opacity:0.75;"></a>
+      {%- endif -%}
 
       {% if site.data.contact.size > 0 %}
         <span class="icon-border"></span>
@@ -180,3 +111,65 @@
   <!-- .sidebar-bottom -->
 </aside>
 <!-- #sidebar -->
+
+{%- comment -%}
+  Language switch button.
+  Rendered client-side because polyglot rewrites internal href attributes
+  (including absolute URLs matching site.url) at build time, which would
+  send every link back to the active language.
+{%- endcomment -%}
+{%- if site.languages and site.languages.size > 1 -%}
+<script>
+  (function () {
+    var el = document.getElementById('lang-switch');
+    if (!el) return;
+    var defaultLang = el.dataset.defaultLang;
+    var langs = el.dataset.languages.split(',');
+    var baseurl = el.dataset.baseurl || '';
+    var STORAGE_KEY = 'preferred-lang';
+    var REDIRECT_FLAG = 'lang-auto-redirected';
+
+    var path = location.pathname;
+    if (baseurl && path.indexOf(baseurl) === 0) path = path.slice(baseurl.length) || '/';
+    var langPattern = new RegExp('^\\/(' + langs.join('|') + ')(\\/|$)');
+    var m = path.match(langPattern);
+    var currentLang = defaultLang;
+    var basePath = path;
+    if (m && m[1] !== defaultLang) {
+      currentLang = m[1];
+      basePath = path.slice(('/' + m[1]).length) || '/';
+    }
+
+    // Auto-redirect first-time visitors based on stored preference or browser language.
+    try {
+      var stored = localStorage.getItem(STORAGE_KEY);
+      var redirected = sessionStorage.getItem(REDIRECT_FLAG);
+      if (!redirected) {
+        var preferred = stored;
+        if (!preferred) {
+          var nav = (navigator.language || navigator.userLanguage || '').toLowerCase();
+          for (var i = 0; i < langs.length; i++) {
+            if (nav === langs[i] || nav.indexOf(langs[i] + '-') === 0) { preferred = langs[i]; break; }
+          }
+        }
+        if (preferred && preferred !== currentLang && langs.indexOf(preferred) !== -1) {
+          sessionStorage.setItem(REDIRECT_FLAG, '1');
+          var dest = baseurl + (preferred === defaultLang ? '' : '/' + preferred) + basePath;
+          location.replace(dest);
+          return;
+        }
+      }
+    } catch (e) { /* storage blocked; fall through */ }
+
+    var idx = langs.indexOf(currentLang);
+    var nextLang = langs[(idx + 1) % langs.length];
+    var target = baseurl + (nextLang === defaultLang ? '' : '/' + nextLang) + basePath;
+    el.setAttribute('href', target);
+    el.textContent = nextLang.toUpperCase();
+    el.setAttribute('title', 'Switch to ' + nextLang.toUpperCase());
+    el.addEventListener('click', function () {
+      try { localStorage.setItem(STORAGE_KEY, nextLang); } catch (e) {}
+    });
+  })();
+</script>
+{%- endif -%}
