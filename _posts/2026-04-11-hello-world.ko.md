@@ -1,36 +1,36 @@
 ---
-title: Hello, World
+title: 안녕, 월드
 date: 2026-04-11 12:00:00 +0900
 categories: [Meta]
 tags: [intro]
-lang: en
+lang: ko
 ref: hello-world
 permalink: /posts/hello-world/
 ---
 
 {% include lang-switcher.html %}
 
-Test
+테스트
 
-## Code
+## 코드
 
 ```python
 def hello(name: str) -> str:
-    return f"Hello, {name}"
+    return f"안녕, {name}"
 
 
-print(hello("world"))
+print(hello("월드"))
 ```
 
-## Math
+## 수식
 
-Inline ($e^{i\pi} + 1 = 0$)
+인라인 ($e^{i\pi} + 1 = 0$)
 
-Block
+블록
 $$
 \mathcal{L} = -\sum_{i} y_i \log \hat{y}_i
 $$
 
 ---
 
-[ref](https://chirpy.cotes.page/)
+[참고](https://chirpy.cotes.page/)

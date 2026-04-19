@@ -1,0 +1,21 @@
+{%- comment -%}
+  Renders a language switcher linking to the same post in other languages.
+  Requires each post to set `lang` and `ref` in its front matter.
+  Pair posts by giving them the same `ref`.
+{%- endcomment -%}
+
+{%- assign current_ref = page.ref -%}
+{%- if current_ref -%}
+<div class="lang-switcher" style="margin: 1rem 0; display: flex; gap: 0.5rem; flex-wrap: wrap;">
+  {%- for lang in site.languages -%}
+    {%- assign match = site.posts | where: "ref", current_ref | where: "lang", lang | first -%}
+    {%- if match -%}
+      {%- if lang == page.lang -%}
+        <span class="lang-current" style="padding: 0.25rem 0.6rem; border-radius: 0.25rem; background: var(--label-color, #eee); font-weight: 600;">{{ lang | upcase }}</span>
+      {%- else -%}
+        <a class="lang-link" href="{{ match.url | relative_url }}" style="padding: 0.25rem 0.6rem; border-radius: 0.25rem; border: 1px solid var(--main-border-color, #ccc);">{{ lang | upcase }}</a>
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+</div>
+{%- endif -%}

@@ -8,6 +8,12 @@ theme: jekyll-theme-chirpy
 # otherwise, the layout language will use the default value of 'en'.
 lang: en
 
+# jekyll-polyglot: multilingual site settings
+languages: ["en", "ko"]
+default_lang: "en"
+exclude_from_localization: ["assets", "javascript", "images", "css", "public", "robots.txt", "feed.xml", "manifest.json", "sitemap.xml", "sw.js", "app.js", "sw.master.js", "swregister.js"]
+parallel_localization: true
+
 # Change to your timezone › https://zones.arilyn.cc
 timezone: Asia/Seoul
 
@@ -165,6 +171,9 @@ kramdown:
     block:
       line_numbers: true
       start_line: 1
+
+plugins:
+  - jekyll-polyglot
 
 collections:
   tabs:
