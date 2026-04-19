@@ -140,7 +140,6 @@
       basePath = path.slice(('/' + m[1]).length) || '/';
     }
 
-    // Auto-redirect first-time visitors based on stored preference or browser language.
     try {
       var stored = localStorage.getItem(STORAGE_KEY);
       var redirected = sessionStorage.getItem(REDIRECT_FLAG);
