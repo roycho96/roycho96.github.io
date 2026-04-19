@@ -6,6 +6,7 @@ tags: [intro]
 lang: ko
 ref: hello-world
 permalink: /posts/hello-world/
+math: true
 ---
 
 테스트

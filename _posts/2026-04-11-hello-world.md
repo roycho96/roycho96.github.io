@@ -6,6 +6,7 @@ tags: [intro]
 lang: en
 ref: hello-world
 permalink: /posts/hello-world/
+math: true
 ---
 
 Test
