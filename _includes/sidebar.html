@@ -26,9 +26,9 @@
       <div class="lang-toggle mt-2 d-flex justify-content-center" style="gap: 0.35rem; font-size: 0.75rem;">
         {%- for lang in site.languages -%}
           {%- if lang == site.default_lang -%}
-            {%- assign target = site.baseurl | append: base_path -%}
+            {%- assign target = site.url | append: site.baseurl | append: base_path -%}
           {%- else -%}
-            {%- assign target = site.baseurl | append: '/' | append: lang | append: base_path -%}
+            {%- assign target = site.url | append: site.baseurl | append: '/' | append: lang | append: base_path -%}
           {%- endif -%}
           {%- if lang == active_lang -%}
             <span aria-current="page" style="padding: 0.1rem 0.5rem; border-radius: 999px; background: var(--btn-bg, rgba(128,128,128,0.25)); color: var(--text-color); font-weight: 600; letter-spacing: 0.05em;">{{ lang | upcase }}</span>
