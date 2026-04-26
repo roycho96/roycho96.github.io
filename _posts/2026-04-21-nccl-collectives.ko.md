@@ -12,7 +12,7 @@ mermaid: true
 
 ## 1. 왜 Collective 인가
 
-여러 프로세스가 있을 때 1:1 통신만으로 broadcast 나 reduce 같은 집단 동작을 짜면 빠르게 비효율로 간다. Parallel computing 은 그래서 집단 단위 통신 패턴 (collective) 을 공식 API 로 제공한다. MPI 시대부터 굳어진 추상이고, NCCL 은 같은 개념을 GPU 와 NVLink / InfiniBand (IB) / RDMA (Remote Direct Memory Access) 위에 옮겨 놓은 것.
+여러 프로세스가 있을 때 1:1 통신만으로 broadcast 나 reduce 같은 집단 동작을 짜면 통신 시간이 노드 수에 선형으로 늘어난다. Parallel computing 은 그래서 집단 단위 통신 패턴 (collective) 을 공식 API 로 제공한다. MPI 시대부터 굳어진 추상이고, NCCL 은 같은 개념을 GPU 와 NVLink / InfiniBand (IB) / RDMA (Remote Direct Memory Access) 위에 옮겨 놓은 것.
 
 이 글은 NCCL 기준이지만 어휘 자체는 MPI 와 호환된다. AllReduce, AllGather 같은 이름이 똑같고, 알고리즘 선택도 비슷한 cost model 을 쓴다.
 
