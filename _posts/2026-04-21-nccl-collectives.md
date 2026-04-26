@@ -12,7 +12,11 @@ mermaid: true
 
 ## 1. Why Collective?
 
-When many processes are involved, building group-wide actions like broadcast or reduce out of 1:1 communication alone makes communication time scale linearly with node count. So parallel computing exposes group-level communication patterns (collectives) as first-class APIs. The abstraction has been settled since the MPI era, and NCCL is the same idea ported onto GPUs and NVLink / InfiniBand (IB) / RDMA (Remote Direct Memory Access).
+When many processes are involved, building group-wide actions like broadcast or reduce out of 1:1 communication alone makes communication time scale linearly with node count.
+
+For example, suppose the root rank wants to broadcast the same data to the other $p-1$ ranks. With P2P (Send/Recv) alone, the root has to call 1:1 Send $p-1$ times in sequence, and every call funnels data through the root's single outgoing link — so total time scales linearly with the node count. Call the same broadcast as an NCCL collective, however, and internally it's structured as a ring with every link active simultaneously, making the time nearly independent of node count (concrete comparison in §5.1).
+
+So parallel computing exposes group-level communication patterns (collectives) as first-class APIs. The abstraction has been settled since the MPI era, and NCCL is the same idea ported onto GPUs and NVLink / InfiniBand (IB) / RDMA (Remote Direct Memory Access).
 
 This post is NCCL-centric, but the vocabulary is MPI-compatible. Names like AllReduce, AllGather are identical, and the algorithm-selection logic uses a similar cost model.
 
