@@ -183,7 +183,7 @@ The communicator API is the same, but what happens on the wire differs entirely 
 | 1 | P2P over NVLink | direct NVLink |
 | 2 | P2P over PCIe | no NVLink |
 | 3 | SHM (via host memory) | P2P unavailable, or inter-socket P2P is inefficient |
-| 4 | NIC loopback | multi-socket + per-GPU local NIC + GDRDMA |
+| 4 | NIC loopback | multi-socket + per-GPU local NIC + GPUDirect RDMA |
 
 Within a single process, ranks get P2P_DIRECT and bypass the FIFO entirely (the `direct*` primitives in §5.2).
 
@@ -198,11 +198,17 @@ GPU kernel → GPU vidmem → CPU proxy thread → NIC → wire → NIC → ...
 ```
 
 - Once a GPU kernel fills a buffer, the **CPU proxy thread** (`ncclProxyService`, `src/proxy.cc`) posts the NIC's RDMA write or socket send. The CPU never touches the data itself, but orchestrating NIC operations is host-thread work.
-- **GDRDMA available** (NIC and GPU share a PCIe switch or sit within the same complex of bridges; gated by `ncclTopoCheckGdr` in `src/graph/paths.cc`) means the intermediate buffer lives in GPU vidmem and the NIC reads/writes GPU memory directly. `NCCL_NET_GDR_LEVEL` tunes the threshold.
+- **GPUDirect RDMA available** (NIC and GPU share a PCIe switch or sit within the same complex of bridges; gated by `ncclTopoCheckGdr` in `src/graph/paths.cc`) means the intermediate buffer lives in GPU vidmem and the NIC reads/writes GPU memory directly. `NCCL_NET_GDR_LEVEL` tunes the threshold.
 - **Unavailable** routes through host pinned memory: GPU → host copy → NIC RDMA → peer host → GPU copy. Two extra PCIe traversals.
 - A **rendezvous** where the two sides agree on buffer readiness precedes every data transfer.
 
-DMA devices like GPUs and NICs bypass the OS and read/write physical addresses directly, so if a page got swapped mid-transfer the DMA would land on the wrong memory. Staging buffers therefore have to be pinned. The familiar analogy: PyTorch DataLoader's `pin_memory=True` produces exactly this memory type. There it speeds up dataset → GPU H2D copies (and lets `non_blocking=True` actually run async). NCCL uses host pinned memory as a staging buffer for the same reason whenever GDRDMA isn't available. The underlying CUDA API for both is `cudaHostAlloc` / `cudaHostRegister`.
+DMA devices like GPUs and NICs bypass the OS and read/write physical addresses directly, so if a page got swapped mid-transfer the DMA would land on the wrong memory. Staging buffers therefore have to be pinned. The familiar analogy: PyTorch DataLoader's `pin_memory=True` produces exactly this memory type. There it speeds up dataset → GPU H2D copies (and lets `non_blocking=True` actually run async). NCCL uses host pinned memory as a staging buffer for the same reason whenever GPUDirect RDMA isn't available. The underlying CUDA API for both is `cudaHostAlloc` / `cudaHostRegister`.
+
+#### Topology graph
+
+A *topology graph* models a node's hardware (GPUs, NICs, PCIe bridges, NVSwitches, NUMA domains) and the links between them (NVLink, PCIe, C2C) as nodes and edges. NCCL builds it at init. The intra-node priority, the GPUDirect RDMA gating, and the algorithm picked in §5 are all decisions on this graph. `ncclTopoGetSystem` (`src/graph/topo.cc`) walks sysfs (`/sys/class/pci_bus`, `/sys/devices/system/node`), queries NVML for NVLink and C2C, and pulls NIC properties from the network plugin to detect GPU, NIC, NVSwitch, PCIe-bridge, and CPU-NUMA nodes. Intra-node ranks then bootstrap-allgather their local views and fuse them into one system graph, and `ncclTopoComputePaths` (`src/graph/paths.cc`) BFS-labels every (source, target) pair with a *path type* (`PATH_LOC` < `NVL` < `NVB` < `C2C` < `PIX` < `PXB` < `P2C` < `PXN` < `PHB` < `SYS` < `NET`) and an aggregate bandwidth.
+
+Transport selection is simple. `selectTransport` walks `{p2p, shm, net, collNet}` and keeps the first one whose `canConnect` accepts the path. `NCCL_P2P_LEVEL` (default `PATH_PXB`) caps how far P2P reaches, and `NCCL_NET_GDR_LEVEL` (default `PATH_P2C` on C2C systems, else `PATH_PXB`) caps GDR. Algorithm search in `src/graph/search.cc` walks the same graph to score Ring, Tree, NVLS, and CollNet patterns. To see what NCCL detected on a given system, run with `NCCL_TOPO_DUMP_FILE=topo.xml`; rank 0 dumps the full system XML. To override detection on a non-standard chassis, point `NCCL_TOPO_FILE` at a hand-edited XML.
 
 This proxy thread is what makes "host async" in §7 Layer 2 more precise. `ncclSend` returning immediately is just the stream enqueue; the GPU kernel fills the buffer next, and only after that does the proxy thread post the NIC operation. Wire traffic happens long after the host call returned. The true end of a collective is the proxy thread's last RDMA completion, not the host call's return.
 
@@ -281,6 +287,8 @@ $$
 The first term $n/B$ is the time the whole dataset spends crossing one link; the second term $O(pc/B)$ is pipeline fill / drain cost. As $m$ grows with smaller chunks, the second term becomes negligible and $T \to n/B$, almost independent of GPU count $p$ (the table above shows $m=3$).
 
 Ring AllReduce extends the same principle. It's not a broadcast: instead, an RS phase ($p-1$ steps accumulating reduces) and an AG phase ($p-1$ steps propagating to all) run consecutively on the same ring.
+
+The bandwidth-optimal $2(p-1)K/(pB)$ of §5.1 falls out as cleanly as it does because NCCL forces one design choice: putting every primitive (send / recv / reduce / forward) inside *one* CUDA kernel. A naïve design that launched separate kernels for the network primitives and the reduce would pay CUDA launch latency on every step instead of once, leave the SM idle between launches, and force the reduce kernel to re-read the just-arrived bytes from HBM. NCCL folds the whole ring traversal plus the reductions into a single kernel. Launch overhead collapses to one. `recv → reduce → send` happens inside the same thread's register set, so the bytes never round-trip through HBM (§5.3, §7 Layer 2). The channel model in §5.0 and the code dive ahead both fall out of that choice.
 
 ### 5.2 The NCCL Ring AllReduce Kernel
 
