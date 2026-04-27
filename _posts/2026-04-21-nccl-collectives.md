@@ -336,8 +336,6 @@ $$
 > - **Simple**: large chunks + memory fence for sync. The `waitPeer` + step-counter pattern below is this. Strong on large messages, but fence overhead makes small-message latency high.
 > - **LL** (Low Latency): flag-based sync via 8 B atomics (4 B data + 4 B flag). No memory fence. Strong on small messages, but bandwidth tops out at 25-50% of peak.
 > - **LL128**: 128 B atomics (120 B data + 8 B flag). Reaches ~95% of peak on intra-node NVLink.
->
-> The algorithm × protocol grid and how NCCL's autotuner picks among them is the focus of the next post.
 
 ### 5.3 What `directRecvReduceDirectSend` Actually Does
 

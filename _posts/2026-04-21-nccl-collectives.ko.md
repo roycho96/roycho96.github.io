@@ -336,8 +336,6 @@ $$
 > - **Simple**: 큰 chunk + memory fence 로 sync. 아래 `waitPeer` + step counter 패턴이 이쪽. large message 에 강하지만 fence overhead 때문에 small message 는 latency 큼.
 > - **LL** (Low Latency): 4B data + 4B flag 의 8B atomic 으로 flag-based sync. memory fence 없음. small message 에 강하지만 대역폭은 peak 의 25-50% 수준.
 > - **LL128**: 120B data + 8B flag 의 128B atomic. NVLink intra-node 에서 peak 의 ~95%.
->
-> algorithm × protocol 의 격자와 NCCL autotuner 의 선택 로직은 다음 글에서 본격적으로 다룬다.
 
 ### 5.3 `directRecvReduceDirectSend` 가 하는 일
 
