@@ -14,7 +14,7 @@ mermaid: true
 
 When many processes are involved, building group-wide actions like broadcast or reduce out of 1:1 communication alone makes communication time scale linearly with node count.
 
-For example, suppose the root rank wants to broadcast the same data to the other $p-1$ ranks. With P2P (Send/Recv) alone, the root has to call 1:1 Send $p-1$ times in sequence, and every call funnels data through the root's single outgoing link — so total time scales linearly with the node count. Call the same broadcast as an NCCL collective, however, and NCCL automatically picks one algorithm (ring, tree, NVLS, CollNet, PAT) based on topology, message size, and the collective itself. For a large-message broadcast or allreduce the ring family is the right intuition: every link is active simultaneously, so total time becomes nearly independent of node count (concrete comparison in §5.1).
+For example, suppose the root rank wants to broadcast the same data to the other $p-1$ ranks. With P2P (Send/Recv) alone, the root has to call 1:1 Send $p-1$ times in sequence, and every call funnels data through the root's single outgoing link, so total time scales linearly with the node count. Call the same broadcast as an NCCL collective, however, and NCCL automatically picks one algorithm (ring, tree, NVLS, CollNet, PAT) based on topology, message size, and the collective itself. For a large-message broadcast or allreduce the ring family is the right intuition: every link is active simultaneously, so total time becomes nearly independent of node count (concrete comparison in §5.1).
 
 So parallel computing exposes group-level communication patterns (collectives) as first-class APIs. The abstraction has been settled since the MPI era, and NCCL is the same idea ported onto GPUs and NVLink / InfiniBand (IB) / RDMA (Remote Direct Memory Access).
 
@@ -61,9 +61,9 @@ _Figure 3. Scatter. The root's large buffer is split into per-rank pieces._
 ![Gather: all → root, concatenated](/assets/img/posts/nccl-collectives/gather.png){: width="420"}
 _Figure 4. Gather. All ranks' chunks are concatenated at the root in rank order._
 
-Compose these four and you get the rest. AllGather is Gather + Broadcast (every rank holds every chunk). AllReduce is Reduce + Broadcast (the reduced result reaches every rank). ReduceScatter is Reduce + Scatter (combine, then redistribute by chunk). AlltoAll is Scatter × N transposed — every rank sends a different chunk to every rank.
+Compose these four and you get the rest. AllGather is Gather + Broadcast (every rank holds every chunk). AllReduce is Reduce + Broadcast (the reduced result reaches every rank). ReduceScatter is Reduce + Scatter (combine, then redistribute by chunk). AlltoAll is Scatter × N transposed: every rank sends a different chunk to every rank.
 
-AllReduce can be implemented as Reduce + Broadcast or as ReduceScatter + AllGather. The latter is what MPICH/NCCL use under the names Rabenseifner / Ring. Same semantics, but the choice of decomposition determines performance — we revisit this with NCCL code in §5.
+AllReduce can be implemented as Reduce + Broadcast or as ReduceScatter + AllGather. The latter is what MPICH/NCCL use under the names Rabenseifner / Ring. Same semantics, but the choice of decomposition determines performance, and we revisit this with NCCL code in §5.
 
 ## 4. NCCL Primitive Catalog
 
@@ -96,7 +96,7 @@ _Figure 6. AllGather. All ranks receive the concatenation of every chunk in rank
 _Figure 7. ReduceScatter. Combine, then split into per-rank chunks._
 
 ![AlltoAll](/assets/img/posts/nccl-collectives/alltoall.png){: width="480"}
-_Figure 8. AlltoAll. Every rank sends a distinct chunk to every other rank — the core operation behind MoE expert dispatch._
+_Figure 8. AlltoAll. Every rank sends a distinct chunk to every other rank. This is the core operation behind MoE expert dispatch._
 
 ### 4.2 Point-to-Point
 
@@ -109,17 +109,17 @@ Official since NCCL 2.7. Wrap multiple Send/Recv calls in `ncclGroupStart/End` a
 
 ### 4.3 One-sided RMA + Signal
 
-**RMA** (Remote Memory Access) is the model where, unlike two-sided communication that requires a sender's `Send` matched with a receiver's `Recv`, *only one side calls in*. The receiver just pre-registers a portion of its memory as a *window*; the sender then reads/writes that window directly whenever it wants. The receiver never has to call `Recv` at all. The key point is that the rendezvous coupling between the two sides goes away. In that sense two-sided is a sync communication model and one-sided RMA is async (we revisit this in §7 Layer 2). The MPI-2 idioms `MPI_Put` / `MPI_Get` / `MPI_Win` are the prototype, and NCCL has shipped the host-side one-sided RMA API (`ncclPutSignal` / `ncclSignal` / `ncclWaitSignal`) since NCCL 2.29.2 (CUDA 12.5+ required).
+**RMA** (Remote Memory Access) is a model where *only one side calls in*, unlike two-sided where a sender's `Send` has to be matched by a receiver's `Recv`. The receiver pre-registers a portion of its memory as a *window*, and the sender reads/writes that window directly whenever it wants. The receiver never calls `Recv` at all. The rendezvous coupling between the two sides is what disappears, and in that sense two-sided is a sync communication model while one-sided RMA is async (we revisit this in §7 Layer 2). The MPI-2 idioms `MPI_Put` / `MPI_Get` / `MPI_Win` are the prototype, and NCCL has shipped the host-side one-sided RMA API (`ncclPutSignal` / `ncclSignal` / `ncclWaitSignal`) since NCCL 2.29.2 (CUDA 12.5+ required).
 
-A **window** here is the handle for "a memory region exposed for RMA," registered with a communicator. In NCCL you call `ncclCommWindowRegister(comm, buff, size, *win, flags)` to turn a region of GPU vidmem into a window. Once registered, only other ranks in the same communicator can RMA into that region — and only through this window. Explicit registration rather than blanket memory exposure, for safety.
+A **window** here is the handle for "a memory region exposed for RMA," registered with a communicator. In NCCL you call `ncclCommWindowRegister(comm, buff, size, *win, flags)` to turn a region of GPU vidmem into a window. Once registered, only other ranks in the same communicator can RMA into that region, and only through this window. Explicit registration rather than blanket memory exposure, for safety.
 
-**Signal** is the lightweight notification primitive paired with RMA — the doorbell for "I'm done writing, you can read now," decoupled from data movement. The producer calls `ncclPutSignal` to write + notify; the consumer calls `ncclWaitSignal` to wait until ready. This fits producer/consumer patterns where the consumer doesn't need to pre-post a `Recv` (e.g., GPU-resident KV cache, prefill/decode separation).
+**Signal** is the lightweight notification primitive paired with RMA, the doorbell for "I'm done writing, you can read now," decoupled from data movement. The producer calls `ncclPutSignal` to write + notify; the consumer calls `ncclWaitSignal` to wait until ready. This fits producer/consumer patterns where the consumer doesn't need to pre-post a `Recv` (e.g., GPU-resident KV cache, prefill/decode separation).
 
 #### Mapping to familiar OS concepts
 
 Two-sided Send/Recv resembles message-passing IPC (pipes or message queues). Both sides have to explicitly match write/read calls, and one side stalling blocks the other. RMA windows, in contrast, correspond to shared-memory IPC, or `mmap`. One side registers a memory region as shared, and the other accesses it as if it were in its own address space.
 
-`ncclPutSignal`'s data transfer follows the same picture as DMA (Direct Memory Access): no CPU or OS kernel in the path; the NIC or GPU writes directly into the peer's memory (window). That is zero-copy. Signal / WaitSignal, abstractly, is closer to a condition variable or hardware doorbell. The point is that data movement and the ready notification are decoupled, and the consumer no longer has to pre-post a matching `ncclRecv`. Whichever progress model the implementation uses (polling / interrupt / sequence counter) depends on the transport and hardware; the device-side spin-wait in §5.3 is one form of NCCL synchronization among others.
+`ncclPutSignal`'s data transfer follows the same picture as DMA (Direct Memory Access): no CPU or OS kernel in the path; the NIC or GPU writes directly into the peer's memory (window). That is zero-copy. Signal / WaitSignal, abstractly, is closer to a condition variable or hardware doorbell. Data movement and the ready notification are decoupled, and the consumer no longer has to pre-post a matching `ncclRecv`. Whichever progress model the implementation uses (polling / interrupt / sequence counter) depends on the transport and hardware; the device-side spin-wait in §5.3 is one form of NCCL synchronization among others.
 
 #### NCCL API
 
@@ -130,13 +130,13 @@ The API surface from `nccl.h.in`:
 | `ncclPutSignal(localbuff, count, dtype, peer, peerWin, peerWinOffset, sigIdx, ctx, flags, comm, stream)` | push data + signal to peer's window in one call |
 | `ncclSignal(peer, sigIdx, ctx, flags, comm, stream)` | signal-only, no data |
 | `ncclWaitSignal(nDesc, signalDescs, comm, stream)` | wait on multiple signals via a descriptor array |
-| `ncclCommWindowRegister(comm, buff, size, *win, flags)` | register a memory window for RMA |
+| `ncclCommWindowRegister(comm, buff, size, *win, winFlags)` | register a memory window for RMA |
 | `ncclCommWindowDeregister(comm, win)` | deregister |
 | `ncclWinGetUserPtr(comm, win, **outUserPtr)` | get the symmetric memory pointer |
 
 > `ncclWaitSignal`'s `signalDescs` is an array of `{opCnt, peer, sigIdx, ctx}` structs. `sigIdx` / `ctx` are pinned to 0 for now (must be 0). `ncclPutSignal` / `ncclSignal`'s `flags` is also reserved (0). All reserved fields for future multi-context / multi-signal extensions.
 
-The `ncclWindow_t peerWin` taken by `ncclPutSignal` is an opaque handle to a GPU-vidmem-backed window. This fits distributed reader/writer patterns or a GPU-resident KV cache — anywhere "one side just needs to write into the other side's memory."
+The `ncclWindow_t peerWin` taken by `ncclPutSignal` is an opaque handle to a GPU-vidmem-backed window. This fits distributed reader/writer patterns or a GPU-resident KV cache, anywhere "one side just needs to write into the other side's memory."
 
 #### A concrete case: disaggregated prefill/decode
 
@@ -148,7 +148,7 @@ Implemented with RMA + Signal instead, the decode node registers its KV cache re
 
 ### 4.4 `ncclScatter` / `ncclGather` / `ncclAlltoAll`
 
-The eight-collective table includes `ncclScatter`, `ncclGather`, and `ncclAlltoAll`, but their internals are not ring/tree algorithms — they're bundles of Send/Recv pairs. The dispatch in `enqueue.cc` makes this clear.
+The eight-collective table includes `ncclScatter`, `ncclGather`, and `ncclAlltoAll`, but their internals are not ring/tree algorithms; they're bundles of Send/Recv pairs. The dispatch in `enqueue.cc` makes this clear.
 
 ```c
 // from src/enqueue.cc
@@ -180,7 +180,7 @@ The communicator API is the same, but what happens on the wire differs entirely 
 
 | Priority | Path | Condition |
 |---|---|---|
-| 1 | GDRDMA P2P over NVLink | direct NVLink |
+| 1 | P2P over NVLink | direct NVLink |
 | 2 | P2P over PCIe | no NVLink |
 | 3 | SHM (via host memory) | P2P unavailable, or inter-socket P2P is inefficient |
 | 4 | NIC loopback | multi-socket + per-GPU local NIC + GDRDMA |
@@ -200,9 +200,9 @@ GPU kernel → GPU vidmem → CPU proxy thread → NIC → wire → NIC → ...
 - Once a GPU kernel fills a buffer, the **CPU proxy thread** (`ncclProxyService`, `src/proxy.cc`) posts the NIC's RDMA write or socket send. The CPU never touches the data itself, but orchestrating NIC operations is host-thread work.
 - **GDRDMA available** (NIC and GPU share a PCIe switch or sit within the same complex of bridges; gated by `ncclTopoCheckGdr` in `src/graph/paths.cc`) means the intermediate buffer lives in GPU vidmem and the NIC reads/writes GPU memory directly. `NCCL_NET_GDR_LEVEL` tunes the threshold.
 - **Unavailable** routes through host pinned memory: GPU → host copy → NIC RDMA → peer host → GPU copy. Two extra PCIe traversals.
-- A **rendezvous** between the two sides agreeing on buffer readiness sits in front of every data transfer.
+- A **rendezvous** where the two sides agree on buffer readiness precedes every data transfer.
 
-Two terms worth pinning down here. *Staging* is the pattern itself: routing data through an intermediate buffer. *Pinned memory* (page-locked memory) is host RAM the OS isn't allowed to swap out, locked into physical memory. DMA devices like GPUs and NICs bypass the OS and read/write physical addresses directly, so if a page got swapped mid-transfer the DMA would land on the wrong memory. Staging buffers therefore have to be pinned. The familiar analogy: PyTorch DataLoader's `pin_memory=True` produces exactly this memory type. There it speeds up dataset → GPU H2D copies (and lets `non_blocking=True` actually run async). NCCL uses host pinned memory as a staging buffer for the same reason whenever GDRDMA isn't available. The underlying CUDA API for both is `cudaHostAlloc` / `cudaHostRegister`.
+DMA devices like GPUs and NICs bypass the OS and read/write physical addresses directly, so if a page got swapped mid-transfer the DMA would land on the wrong memory. Staging buffers therefore have to be pinned. The familiar analogy: PyTorch DataLoader's `pin_memory=True` produces exactly this memory type. There it speeds up dataset → GPU H2D copies (and lets `non_blocking=True` actually run async). NCCL uses host pinned memory as a staging buffer for the same reason whenever GDRDMA isn't available. The underlying CUDA API for both is `cudaHostAlloc` / `cudaHostRegister`.
 
 This proxy thread is what makes "host async" in §7 Layer 2 more precise. `ncclSend` returning immediately is just the stream enqueue; the GPU kernel fills the buffer next, and only after that does the proxy thread post the NIC operation. Wire traffic happens long after the host call returned. The true end of a collective is the proxy thread's last RDMA completion, not the host call's return.
 
@@ -222,7 +222,7 @@ $$
 \text{AllGather} \equiv \text{Gather} + \text{Broadcast}
 $$
 
-ZeRO-3 / FSDP communication design uses the first decomposition (AR = RS + AG) directly: split AllReduce into RS + AG and keep gradients only on the partition. The body of NCCL's Ring AllReduce kernel is also exactly two loops — one for the RS phase, one for the AG phase.
+ZeRO-3 / FSDP communication design uses the first decomposition (AR = RS + AG) directly: split AllReduce into RS + AG and keep gradients only on the partition. The body of NCCL's Ring AllReduce kernel is also exactly two loops: one for the RS phase, one for the AG phase.
 
 ### 5.0 Communication Channels: one collective = N parallel rings
 
@@ -231,7 +231,7 @@ So far we've been drawing "ring" as a single path, but NCCL actually splits one 
 - kernel grid: `dim3 grid = {(unsigned)nChannels, 1, 1};` (`src/enqueue.cc`). One channel = one CUDA block.
 - input buffer: partitioned into per-channel disjoint contiguous regions.
 - each channel runs its own ring (or tree) instance *independently*.
-- if per-channel chunks get too small, NIC FIFOs sit underfilled and network throughput tanks. For small messages NCCL heuristically reduces `nChannels` (`enqueue.cc::scheduleP2pTasksToPlan` / `calcP2pChunking`).
+- if per-channel chunks get too small, NIC FIFOs sit underfilled and network throughput tanks. For small messages NCCL heuristically reduces `nChannels` (`enqueue.cc::scheduleP2pTasksToPlan`).
 
 So the `runRing` we'll meet in §5.2 is the ring run *for one channel*, and within the same kernel launch nChannels blocks run the same code over different data segments simultaneously. This doesn't contradict the single-kernel model of §7 Layer 2; it sharpens it. One kernel launch, with a grid of nChannels inside.
 
@@ -293,7 +293,7 @@ Ring AllReduce splits data into $p$ chunks and starts GPU $i$ from chunk $i$. At
 _Figure 11. One Scatter-Reduce iteration. Every GPU simultaneously sends one chunk to the next GPU and receives one chunk from the previous GPU, accumulating it with the local value._
 
 ![AllGather iteration](/assets/img/posts/nccl-collectives/gibiansky-allgather-step.png){: width="560"}
-_Figure 12. One AllGather iteration. After RS finishes, the same ring is traversed once more — this time overwriting instead of reducing._
+_Figure 12. One AllGather iteration. After RS finishes, the same ring is traversed once more, this time overwriting instead of reducing._
 
 After $p-1$ iterations of each phase, RS leaves GPU $i$ holding the reduced result for chunk $(i+1) \bmod p$, and AG ends with all GPUs holding all chunks. The `offset` variable in the code carries this indexing.
 
@@ -358,15 +358,18 @@ void recvReduceSend(intptr_t inpIx, int eltN, bool postOp=false) {
 }
 ```
 
-The variants (`directSend`, `directRecv`, `directRecvCopyDirectSend`, `recvReduceSend`, …) are all instances of the same `genericOp<DirectRecv, DirectSend, Recv, Send, SrcBuf, DstBuf>` template. The 21 combinations differing only in template parameters basically *are* NCCL's kernel-level vocabulary.
+The variants (`directSend`, `directRecv`, `directRecvCopyDirectSend`, `recvReduceSend`, …) are all instances of the same `genericOp<DirectRecv, DirectSend, Recv, Send, SrcBuf, DstBuf>` template. The 25 combinations differing only in template parameters basically *are* NCCL's kernel-level vocabulary.
 
 What one `genericOp` call does internally:
 1. `waitPeer()`. Spin until the peer's step counter advances.
 2. `subBarrier()`. Synchronize worker threads in the block.
 3. `reduceCopy<...>(srcs, dsts, workSize)`. Take the received data, element-wise reduce with the local Input, and store into the next fifo.
-4. `postPeer()`. Increment our own step counter to notify the next peer.
+4. `barrier()`. Block-wide barrier after the reduce-copy.
+5. `postPeer()`. Increment our own step counter to notify the next peer.
 
-So one `directRecvReduceDirectSend` is a single cycle of spin-wait → barrier → fused reduce-copy → notify. This cycle runs once per ring step, with the host CPU never involved. We come back to what this single-kernel design implies in §7 Layer 2.
+(Network-device transports also slot in an `ncclNetDeviceUnpack` plus an extra `subBarrier` between steps 2 and 3.)
+
+So one `directRecvReduceDirectSend` is a single cycle of spin-wait → fused reduce-copy → notify, with thread-block barriers between stages. This cycle runs once per ring step, with the host CPU never involved. We come back to what this single-kernel design implies in §7 Layer 2.
 
 ## 6. P2P vs Collective
 
@@ -427,7 +430,7 @@ Running multiple P2Ps concurrently requires `ncclGroupStart/End`. The NCCL heade
 
 > "This operation is blocking for the GPU. If multiple ncclSend and ncclRecv operations need to progress concurrently to complete, they must be fused within a ncclGroupStart/ncclGroupEnd section." (`nccl.h.in`)
 
-The `ncclGroupDepth` counter in `src/group.cc` is thread-local. While depth > 0, collective calls don't launch immediately — they queue, and `ncclGroupEnd` flushes them as a single kernel launch. The send/recv pairs need to live in one kernel for GPUs to avoid waiting on each other forever, which is why the group call is the central piece for deadlock prevention.
+The `ncclGroupDepth` counter in `src/group.cc` is thread-local. While depth > 0, collective calls don't launch immediately; they queue, and `ncclGroupEnd` flushes them as a single kernel launch. The send/recv pairs need to live in one kernel for GPUs to avoid waiting on each other forever, which is why the group call is the central piece for deadlock prevention.
 
 ## 7. Sync vs Async
 
@@ -435,11 +438,11 @@ The "is an NCCL collective sync or async?" question gets confusing because two p
 
 ### Layer 1. Training-level perspective
 
-Large-scale LLM training is typically synchronous (BSP). You can't move on to the next step's weight update until the required collective / P2P finishes. PyTorch DDP docs call constructor / forward / backward "distributed synchronization points" for this reason. Even with overlap / prefetch options on, that's Layer-2 concurrent execution — not async by definition.
+Large-scale LLM training is typically synchronous (BSP). You can't move on to the next step's weight update until the required collective / P2P finishes. PyTorch DDP docs call constructor / forward / backward "distributed synchronization points" for this reason. Even with overlap / prefetch options on, that's Layer-2 concurrent execution, not async by definition.
 
 ### Layer 2. NCCL API / CUDA stream
 
-Both collectives and P2P calls return immediately after enqueueing onto the CUDA stream — host-async. In code:
+Both collectives and P2P calls return immediately after enqueueing onto the CUDA stream. Host-async. In code:
 
 ```c
 // src/enqueue.cc::ncclLaunchKernel
@@ -452,9 +455,9 @@ ncclResult_t ncclLaunchKernel(struct ncclComm* comm, struct ncclKernelPlan* plan
 }
 ```
 
-One `cuLaunchKernel` invocation is one collective call. That's why a `dist.all_reduce(...)` looks like it finishes in milliseconds from Python — the actual wire traffic happens later, on the GPU.
+One `cuLaunchKernel` invocation is one collective call. That's why a `dist.all_reduce(...)` looks like it finishes in milliseconds from Python; the actual wire traffic happens later, on the GPU.
 
-NCCL implements communication and computation as a single kernel. Looking at `reduceCopyPacks`'s inner loop — the heart of the `genericOp` we saw in §5.3 — makes the fused structure obvious:
+NCCL implements communication and computation as a single kernel. Looking at `reduceCopyPacks`'s inner loop (the heart of the `genericOp` we saw in §5.3) makes the fused structure obvious:
 
 ```c
 // from src/device/common_kernel.h::reduceCopyPacks
@@ -472,9 +475,9 @@ while (...) {
 
 A single thread runs `ld_volatile_global → applyReduce → st_global` in the same register set. No CPU, no other kernel. When the kernel actually runs on the GPU, chunks flow around the ring while reductions happen inside the same kernel (cf. §5). From the host's point of view it's async; from a distributed-systems point of view it's a rendezvous. Both views are simultaneously correct.
 
-To unpack what "rendezvous from a distributed-systems point of view" really means: NCCL's `ncclSend` / `ncclRecv` returns immediately on the host call, so it looks async on the surface, but as long as it's two-sided, the data is never delivered if the receiver doesn't call `ncclRecv`. MPI's non-blocking `MPI_Isend` / `MPI_Irecv` is the same story: the call returns immediately, but both sides still have to logically post a matching call, and that coupling (rendezvous) survives. Whether the API is blocking or not, two-sided is a fundamentally sync communication model.
+A bit more on what "rendezvous from a distributed-systems point of view" means: NCCL's `ncclSend` / `ncclRecv` returns immediately on the host call, so it looks async on the surface, but as long as it's two-sided, the data is never delivered if the receiver doesn't call `ncclRecv`. MPI's non-blocking `MPI_Isend` / `MPI_Irecv` is the same story: the call returns immediately, but both sides still have to logically post a matching call, and that coupling (rendezvous) survives. Whether the API is blocking or not, two-sided is a sync communication model.
 
-The coupling actually disappears only with the one-sided RMA in §4.3, namely `ncclPutSignal` / `ncclWaitSignal`. Once the receiver registers a window via `ncclCommWindowRegister`, it makes no further calls; the sender writes directly into that memory. The "two-sided is sync, one-sided is async" contrast isn't about whether the API is blocking; it's about this architectural coupling. That's why patterns where producer and consumer timing has to be decoupled, like the prefill/decode disaggregation we saw in §4.3, fit RMA naturally.
+The coupling disappears only with the one-sided RMA in §4.3, namely `ncclPutSignal` / `ncclWaitSignal`. Once the receiver registers a window via `ncclCommWindowRegister`, it makes no further calls; the sender writes directly into that memory. So "two-sided is sync, one-sided is async" describes this architectural coupling, not whether the API call is blocking. That's why patterns where producer and consumer timing has to be decoupled (the prefill/decode disaggregation in §4.3) fit RMA naturally.
 
 To recap, whether NCCL is sync or async depends on the perspective.
 
