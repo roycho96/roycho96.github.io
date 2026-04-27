@@ -105,11 +105,19 @@ NCCL 2.7 부터 공식. 여러 Send/Recv 를 `ncclGroupStart/End` 로 묶으면 
 
 ### 4.3 One-sided RMA + Signal
 
-**RMA** (Remote Memory Access) 는 sender 의 `Send` + receiver 의 `Recv` 매칭이 필요한 two-sided 와 달리 *한 쪽만 호출*하면 되는 모델. Target 이 자기 메모리의 일부 영역을 *window* 로 미리 등록해두면 origin 이 그 window 에 직접 read/write. MPI-2 의 `MPI_Put` / `MPI_Get` / `MPI_Win` 이 원형이고, NCCL 에도 같은 모델이 들어와 있다.
+**RMA** (Remote Memory Access) 는 sender 의 `Send` + receiver 의 `Recv` 매칭이 필요한 two-sided 와 달리 *한 쪽만 호출*하면 되는 모델. Receiver 는 자기 메모리의 일부 영역을 *window* 로 미리 등록해두기만 하면, sender 가 원하는 시점에 그 window 에 직접 read/write 한다. Receiver 쪽에서 `Recv` 를 부를 일 자체가 없다. 양측 사이 결합 (rendezvous) 이 풀리는 것이 핵심이고, 그 의미에서 two-sided 는 sync, one-sided RMA 는 async 한 통신 모델이다 (§7 Layer 2 에서 다시). MPI-2 의 `MPI_Put` / `MPI_Get` / `MPI_Win` 이 원형이고, NCCL 도 2.28 부터 같은 모델을 preview 로 제공한다.
 
 여기서 **window** 는 "RMA 대상으로 노출할 메모리 영역" 을 communicator 에 등록한 handle. NCCL 에서는 `ncclCommWindowRegister(comm, buff, size, *win, flags)` 로 GPU vidmem 의 한 영역을 window 로 만든다. 등록되면 같은 communicator 의 다른 rank 들이 이 window 를 통해서만 그 영역에 RMA 를 걸 수 있다 (전체 메모리 노출이 아니라 명시 등록만, 보안/안정성 측면).
 
-**Signal** 은 RMA 와 짝을 이루는 가벼운 동기화 noti. "데이터 다 썼으니 읽어도 돼" 를 데이터 이동과 별개로 던지는 doorbell. Producer 는 PutSignal 로 write + notify, consumer 는 WaitSignal 로 ready 시점만 기다리면 된다. 미리 Recv 안 띄워도 되는 producer/consumer 패턴 (GPU-resident KV cache, prefill/decode 분리 등) 에 적합.
+**Signal** 은 RMA 와 짝을 이루는 가벼운 동기화 noti. "데이터 다 썼으니 읽어도 돼" 를 데이터 이동과 별개로 던지는 doorbell. Producer 는 `ncclPutSignal` 로 write + notify, consumer 는 `ncclWaitSignal` 로 ready 시점만 기다리면 된다. 미리 Recv 안 띄워도 되는 producer/consumer 패턴 (GPU-resident KV cache, prefill/decode 분리 등) 에 적합.
+
+#### OS 의 익숙한 개념으로 정리
+
+Two-sided Send/Recv 는 OS 의 message passing IPC (pipe 나 message queue) 에 가깝다. 양쪽이 명시적으로 write/read 호출을 맞춰야 하고, 한 쪽이 늦으면 다른 쪽이 block 된다. 반면 RMA window 는 shared memory IPC 또는 `mmap` 에 대응한다. 한 쪽이 특정 메모리 영역을 공유 가능한 영역으로 등록해두면 다른 쪽은 그 영역을 자기 주소공간처럼 접근한다.
+
+`ncclPutSignal` 의 데이터 전송은 DMA (Direct Memory Access) 와 같은 그림이다. CPU / OS kernel 을 거치지 않고 NIC / GPU 가 직접 상대방 메모리 (window) 에 write 한다. 이것이 zero-copy. Signal / WaitSignal 은 condition variable 또는 hardware interrupt 와 비슷하다. busy-wait polling 으로 메모리를 계속 들여다보지 않고, "준비됐다" 신호만 기다리다가 깨어나는 가벼운 동기화.
+
+#### NCCL API
 
 `nccl.h.in` 의 head 에서 본 API:
 
@@ -123,6 +131,12 @@ NCCL 2.7 부터 공식. 여러 Send/Recv 를 `ncclGroupStart/End` 로 묶으면 
 | `ncclWinGetUserPtr(comm, win, **outUserPtr)` | symmetric 메모리 포인터 가져오기 |
 
 `ncclPutSignal` 이 받는 `ncclWindow_t peerWin` 은 GPU vidmem 기반 window 의 opaque handle. 분산 reader/writer pattern 이나 GPU-resident KV cache 처럼 "한 쪽이 다른 쪽 메모리에 쓰기만 하면 되는" 경우에 어울린다.
+
+#### 구체 사례: disaggregated prefill/decode
+
+LLM 추론을 prefill (사용자 prompt 를 읽어 KV cache 생성) 과 decode (KV cache 로 토큰을 한 개씩 생성) 노드로 분리하는 disaggregated serving 아키텍처가 최근 표준이 되어가고 있다 (vLLM, SGLang, Mooncake, DistServe, Splitwise). Prefill 노드가 만든 무거운 KV cache 를 decode 노드 GPU 메모리로 넘겨야 하는데, two-sided `ncclSend` / `ncclRecv` 로 짜면 매번 decode 쪽에서 `ncclRecv` 를 미리 띄워두고 timing 을 맞춰야 해서 KV cache 핸드오프마다 결합도 비용이 든다.
+
+RMA + Signal 로 짜면 decode 가 자기 KV cache 영역을 `ncclCommWindowRegister` 로 window 등록해두고, prefill 이 끝나는 즉시 그 window 에 직접 `ncclPutSignal` 로 DMA write + signal 만 던진다. Decode 는 `ncclWaitSignal` 깨어난 뒤 자기 메모리에 이미 올라온 데이터를 바로 읽어 디코딩 시작. `ncclRecv` 호출도 rendezvous 도 없다. NVIDIA NIXL (GTC 2025 오픈소스, vLLM·SGLang·Dynamo 가 채택) 과 Mooncake Transfer Engine 이 정확히 이 모델로 RDMA 전송을 구현한다. Disaggregation 처럼 producer 와 consumer 의 timing 결합을 끊어야 하는 워크로드가 RMA 의 1 차 사용처다.
 
 > 참고: NCCL 내부 ID 까지 포함하면 함수는 더 많다. `ncclFunc_t` 가 정의하는 enum (`AllGatherV` 등) 까지 합치면 디스패치 함수는 15 개. 사용자 입장에선 위의 8 + 2 + 6 만 알면 된다.
 
@@ -375,6 +389,10 @@ while (...) {
 ```
 
 한 thread 가 `ld_volatile_global → applyReduce → st_global` 을 같은 register set 에서 연속 수행. CPU 도 안 거치고 다른 kernel 도 안 거친다. Stream 에 올라간 kernel 이 GPU 에서 실제로 돌 때 chunk 가 ring 을 따라 흐르고, 동시에 reduction 이 같은 kernel 안에서 일어난다 (§5 참고). 호스트 관점에선 async, 분산 관점에선 rendezvous. 두 관점이 동시에 맞다.
+
+여기서 "분산 관점에선 rendezvous" 라고 한 의미를 좀 더 풀어보면: NCCL 의 `ncclSend` / `ncclRecv` 는 host 호출이 즉시 리턴해서 표면상 async 처럼 보이지만, two-sided 인 이상 receiver 가 `ncclRecv` 를 호출하지 않으면 데이터는 영원히 전달되지 않는다. MPI 의 non-blocking 버전 `MPI_Isend` / `MPI_Irecv` 도 마찬가지로 호출은 즉시 반환되지만 양측이 논리적으로 matching 호출을 맞춰야 한다는 결합 (rendezvous) 은 그대로 남는다. API 가 blocking 이냐 와 무관하게 two-sided 는 본질적으로 sync 한 통신 모델이다.
+
+결합이 사라지는 건 §4.3 의 one-sided RMA, 즉 `ncclPutSignal` / `ncclWaitSignal` 뿐. Receiver 는 `ncclCommWindowRegister` 로 window 만 등록해두면 자기 쪽 호출은 더 이상 없고, sender 가 알아서 그 메모리에 쓴다. "two-sided 는 sync, one-sided 는 async" 라는 대비는 API 가 blocking 이냐의 문제가 아니라 이 아키텍처 결합도의 차이고, 그래서 §4.3 에서 본 prefill/decode disaggregation 같이 producer 와 consumer 의 timing 을 떼어내야 하는 패턴에 RMA 가 자연스럽게 맞는 것.
 
 ---
 

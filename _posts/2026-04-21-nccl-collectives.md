@@ -105,11 +105,19 @@ Official since NCCL 2.7. Wrap multiple Send/Recv calls in `ncclGroupStart/End` a
 
 ### 4.3 One-sided RMA + Signal
 
-**RMA** (Remote Memory Access) is the model where, unlike two-sided communication that requires a sender's `Send` matched with a receiver's `Recv`, *only one side calls in*. The target pre-registers a portion of its memory as a *window*, and the origin reads/writes that window directly. The MPI-2 idioms `MPI_Put` / `MPI_Get` / `MPI_Win` are the prototype, and NCCL ships the same model.
+**RMA** (Remote Memory Access) is the model where, unlike two-sided communication that requires a sender's `Send` matched with a receiver's `Recv`, *only one side calls in*. The receiver just pre-registers a portion of its memory as a *window*; the sender then reads/writes that window directly whenever it wants. The receiver never has to call `Recv` at all. The key point is that the rendezvous coupling between the two sides goes away. In that sense two-sided is a sync communication model and one-sided RMA is async (we revisit this in §7 Layer 2). The MPI-2 idioms `MPI_Put` / `MPI_Get` / `MPI_Win` are the prototype, and NCCL has shipped the same model as a preview since 2.28.
 
 A **window** here is the handle for "a memory region exposed for RMA," registered with a communicator. In NCCL you call `ncclCommWindowRegister(comm, buff, size, *win, flags)` to turn a region of GPU vidmem into a window. Once registered, only other ranks in the same communicator can RMA into that region — and only through this window. Explicit registration rather than blanket memory exposure, for safety.
 
-**Signal** is the lightweight notification primitive paired with RMA — the doorbell for "I'm done writing, you can read now," decoupled from data movement. Producer calls `PutSignal` to write + notify; consumer calls `WaitSignal` to wait until ready. This fits producer/consumer patterns where the consumer doesn't need to pre-post a `Recv` (e.g., GPU-resident KV cache, prefill/decode separation).
+**Signal** is the lightweight notification primitive paired with RMA — the doorbell for "I'm done writing, you can read now," decoupled from data movement. The producer calls `ncclPutSignal` to write + notify; the consumer calls `ncclWaitSignal` to wait until ready. This fits producer/consumer patterns where the consumer doesn't need to pre-post a `Recv` (e.g., GPU-resident KV cache, prefill/decode separation).
+
+#### Mapping to familiar OS concepts
+
+Two-sided Send/Recv resembles message-passing IPC (pipes or message queues). Both sides have to explicitly match write/read calls, and one side stalling blocks the other. RMA windows, in contrast, correspond to shared-memory IPC, or `mmap`. One side registers a memory region as shared, and the other accesses it as if it were in its own address space.
+
+`ncclPutSignal`'s data transfer follows the same picture as DMA (Direct Memory Access): no CPU or OS kernel in the path; the NIC or GPU writes directly into the peer's memory (window). That is zero-copy. Signal / WaitSignal acts like a condition variable or hardware interrupt: instead of busy-waiting polling on memory, you wait for the "ready" notification and wake up when it arrives, which is a cheap synchronization primitive.
+
+#### NCCL API
 
 The API surface from `nccl.h.in`:
 
@@ -123,6 +131,12 @@ The API surface from `nccl.h.in`:
 | `ncclWinGetUserPtr(comm, win, **outUserPtr)` | get the symmetric memory pointer |
 
 The `ncclWindow_t peerWin` taken by `ncclPutSignal` is an opaque handle to a GPU-vidmem-backed window. This fits distributed reader/writer patterns or a GPU-resident KV cache — anywhere "one side just needs to write into the other side's memory."
+
+#### A concrete case: disaggregated prefill/decode
+
+Splitting LLM inference into prefill (read the user's prompt and produce the KV cache) and decode (use the KV cache to generate tokens one at a time) nodes, a *disaggregated serving* architecture, is becoming standard (vLLM, SGLang, Mooncake, DistServe, Splitwise). The heavy KV cache produced by the prefill node has to be transferred into the decode node's GPU memory, and if you implement that with two-sided `ncclSend` / `ncclRecv` the decode side has to pre-post `ncclRecv` and match timing on every handoff, paying a coupling cost per KV cache transfer.
+
+Implemented with RMA + Signal instead, the decode node registers its KV cache region as a window with `ncclCommWindowRegister`, and the moment prefill finishes it just DMA-writes into that window via `ncclPutSignal` and fires a signal. Decode wakes from `ncclWaitSignal`, finds the data already sitting in its memory, and starts decoding immediately. No `ncclRecv` call, no rendezvous. NVIDIA NIXL (open-sourced at GTC 2025, adopted by vLLM, SGLang, Dynamo) and the Mooncake Transfer Engine implement RDMA transfers exactly along these lines. Workloads like disaggregation, where producer and consumer timing has to be decoupled, are the primary use case for RMA.
 
 > Note: counting NCCL's internal IDs there are even more functions. The `ncclFunc_t` enum (with entries like `AllGatherV`) brings the dispatch function count to 15. From a user's perspective the eight + two + six above are enough.
 
@@ -375,6 +389,10 @@ while (...) {
 ```
 
 A single thread runs `ld_volatile_global → applyReduce → st_global` in the same register set. No CPU, no other kernel. When the kernel actually runs on the GPU, chunks flow around the ring while reductions happen inside the same kernel (cf. §5). From the host's point of view it's async; from a distributed-systems point of view it's a rendezvous. Both views are simultaneously correct.
+
+To unpack what "rendezvous from a distributed-systems point of view" really means: NCCL's `ncclSend` / `ncclRecv` returns immediately on the host call, so it looks async on the surface, but as long as it's two-sided, the data is never delivered if the receiver doesn't call `ncclRecv`. MPI's non-blocking `MPI_Isend` / `MPI_Irecv` is the same story: the call returns immediately, but both sides still have to logically post a matching call, and that coupling (rendezvous) survives. Whether the API is blocking or not, two-sided is a fundamentally sync communication model.
+
+The coupling actually disappears only with the one-sided RMA in §4.3, namely `ncclPutSignal` / `ncclWaitSignal`. Once the receiver registers a window via `ncclCommWindowRegister`, it makes no further calls; the sender writes directly into that memory. The "two-sided is sync, one-sided is async" contrast isn't about whether the API is blocking; it's about this architectural coupling. That's why patterns where producer and consumer timing has to be decoupled, like the prefill/decode disaggregation we saw in §4.3, fit RMA naturally.
 
 ---
 
