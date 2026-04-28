@@ -1,20 +1,20 @@
 ---
 icon: fas fa-info-circle
 order: 4
-lang: en
+lang: ko
 ref: about
 ---
 
 ML Sys Engineer.
 
-What this blog covers:
+이 블로그가 다루는 주제:
 
 - GPU kernel optimization
 - Parallel computing
 - Distributed training
 - LLM training / inference systems
 
-Contact:
+연락처:
 
 - GitHub: [@roycho96](https://github.com/roycho96)
 - LinkedIn: [sunghyun-cho-roy](https://www.linkedin.com/in/sunghyun-cho-roy/)
