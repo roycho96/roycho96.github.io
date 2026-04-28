@@ -20,6 +20,8 @@ So parallel computing exposes group-level communication patterns (collectives) a
 
 This post is NCCL-centric, but the vocabulary is MPI-compatible. Names like AllReduce, AllGather are identical, and the algorithm-selection logic uses a similar cost model.
 
+> Code references and function names follow NCCL master as of 2026-04 (v2.30).
+
 ## 2. MPI vs NCCL
 
 | Aspect | MPI | NCCL |
@@ -67,7 +69,7 @@ AllReduce can be implemented as Reduce + Broadcast or as ReduceScatter + AllGath
 
 ## 4. NCCL Primitive Catalog
 
-NCCL's public API splits into three groups: collectives, P2P, and one-sided RMA.
+NCCL's communication API splits into three paradigms: collectives, two-sided P2P, and one-sided RMA. The official docs nest the last two under 'P2P' as sub-categories; this post puts them at the same level because the rendezvous coupling differs between them.
 
 ### 4.1 Eight Collectives
 
@@ -197,7 +199,7 @@ GPU kernel → GPU vidmem → CPU proxy thread → NIC → wire → NIC → ...
                                   └→ RDMA write (IB/RoCE) or socket send
 ```
 
-- Once a GPU kernel fills a buffer, the **CPU proxy thread** (`ncclProxyService`, `src/proxy.cc`) posts the NIC's RDMA write or socket send. The CPU never touches the data itself, but orchestrating NIC operations is host-thread work.
+- Once a GPU kernel fills a buffer, the CPU's `ncclProxyProgress` thread (`src/proxy.cc`) posts the NIC's RDMA write or socket send. NCCL splits the proxy into two threads: `ncclProxyService` handles control-plane setup and connect messages, and `ncclProxyProgress` drives the data side. The CPU never touches the data itself, but orchestrating NIC operations is host-thread work.
 - **GPUDirect RDMA available** (NIC and GPU share a PCIe switch or sit within the same complex of bridges; gated by `ncclTopoCheckGdr` in `src/graph/paths.cc`) means the intermediate buffer lives in GPU vidmem and the NIC reads/writes GPU memory directly. `NCCL_NET_GDR_LEVEL` tunes the threshold.
 - **Unavailable** routes through host pinned memory: GPU → host copy → NIC RDMA → peer host → GPU copy. Two extra PCIe traversals.
 - A **rendezvous** where the two sides agree on buffer readiness precedes every data transfer.
@@ -237,7 +239,7 @@ So far we've been drawing "ring" as a single path, but NCCL actually splits one 
 - kernel grid: `dim3 grid = {(unsigned)nChannels, 1, 1};` (`src/enqueue.cc`). One channel = one CUDA block.
 - input buffer: partitioned into per-channel disjoint contiguous regions.
 - each channel runs its own ring (or tree) instance *independently*.
-- if per-channel chunks get too small, NIC FIFOs sit underfilled and network throughput tanks. For small messages NCCL heuristically reduces `nChannels` (`enqueue.cc::scheduleP2pTasksToPlan`).
+- if per-channel chunks get too small, NIC FIFOs sit underfilled and network throughput tanks. For small messages NCCL heuristically reduces `nChannels` (`enqueue.cc::addP2pToPlan`, the `nChannels[dir] = std::min<int>(nChannelsMin, divUp(bytes[dir], minPartSize));` line).
 
 So the `runRing` we'll meet in §5.2 is the ring run *for one channel*, and within the same kernel launch nChannels blocks run the same code over different data segments simultaneously. This doesn't contradict the single-kernel model of §7 Layer 2; it sharpens it. One kernel launch, with a grid of nChannels inside.
 
