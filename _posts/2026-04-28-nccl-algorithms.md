@@ -20,9 +20,9 @@ The same `AllReduce` call is not always run the same way by NCCL. The choice dep
 
 The **semantics** of `AllReduce` are fixed in one line. "Sum every rank's value and give the result to every rank." **How** to perform that is a separate layer. Which schedule is fastest depends on message size, rank count, topology, and hardware.
 
-So every time a collective call comes in, NCCL builds a 7 algorithms x 3 protocols = 21 cell table. For each cell it computes the predicted time using a cost model and picks the cell with the smallest time (argmin, the location of the minimum).
+So at communicator init, NCCL holds a 7 algorithms x 3 protocols = 21 cell table as the conceptual maximum. For each cell it computes the predicted time using a cost model and picks the cell with the smallest time (argmin, the location of the minimum).
 
-Not every cell is used. Eligibility constraints zero out most of them up front. For AllReduce specifically, only 10 of the 21 cells are actually evaluated (PAT is excluded for AllReduce, removing 3 cells; NVLS, NVLSTree, and CollNet only accept the Simple protocol, removing 8 more). The structure stays the same. Table + argmin.
+Eligibility constraints zero out most of these cells up front. For AllReduce specifically, only up to 10 of the 21 cells are actually evaluated (PAT is excluded for AllReduce, removing 3 cells; NVLS, NVLSTree, and CollNet only accept the Simple protocol, removing 8 more). The structure stays the same. Table + argmin.
 
 The goal of this post is to follow how that table is built and how the host, given a tensor size, decides which (algorithm, protocol) pair to launch, all the way through the NCCL master code.
 
@@ -62,9 +62,10 @@ const char* ncclAlgoStr[NCCL_NUM_ALGORITHMS] = {
 |---|---|---|---|
 | `Ring` | nearest-neighbor pipeline | almost all collectives | per-rank traffic $\sim 2n$ |
 | `Tree` | Double Binary Tree (§4.2) | AllReduce only | tree latency + ring BW |
-| `CollNetDirect` / `CollNetChain` | NVIDIA SHARP (in-network reduce) | AllReduce, RS, AG | requires IB SHARP NIC |
-| `NVLS` | NVSwitch multicast + reduce | AllReduce etc. | Hopper+, requires NVSwitch |
-| `NVLSTree` | NVLS + multi-node tree | AllReduce | 2+ nodes |
+| `CollNetDirect` | collective network transport (in-network reduce) | AllReduce, AG, RS | meaningful with SHARP plugin environment |
+| `CollNetChain` | collective network transport, chain layout | AllReduce only | same |
+| `NVLS` | NVSwitch multicast + reduce | AllReduce, AG, RS | Hopper+, requires NVSwitch |
+| `NVLSTree` | NVLS + multi-node tree | AllReduce | multi-node, NVSwitch + IB |
 | `PAT` | Bruck variant (§4.3) | AllGather, ReduceScatter | 2.23+, 1 GPU per node |
 
 Eligibility cuts which collective takes which algorithm early on (`src/graph/tuning.cc::ncclTopoTuneModel`):
@@ -78,7 +79,7 @@ if ((coll == ncclFuncReduceScatter || coll == ncclFuncAllGather)
 if (coll == ncclFuncAllReduce && a == NCCL_ALGO_PAT) continue;
 ```
 
-In short: Broadcast / Reduce gets only Ring, AllGather / ReduceScatter gets {Ring, PAT, NVLS, CollNet_Direct}, AllReduce gets everything except PAT.
+In short: Broadcast / Reduce gets only Ring, AllGather / ReduceScatter gets {Ring, PAT, NVLS, CollNetDirect}, AllReduce gets everything except PAT. **CollNetChain is AllReduce-only**.
 
 ### 3.2 Six Topology Patterns
 
@@ -100,13 +101,13 @@ BALANCED and SPLIT distribute NIC traffic across two GPUs to relieve PCIe / NVLi
 
 The same algorithm can use one of three wire formats. The data:flag ratio differs.
 
-| Protocol | Cache line | Data efficiency | Suited for |
+| Protocol | Fifo line | Data efficiency | Suited for |
 |---|---|---|---|
-| `LL` | 8B (4B data + 4B flag) | 50% | small messages, latency |
-| `LL128` | 128B (120B data + 8B flag) | 93.75% | NVLink intra-node, mid-size messages |
+| `LL` | 16B fifo line = (4B data + 4B flag) × 2 | 50% | small messages, latency |
+| `LL128` | 128B fifo line = 120B data + 8B flag (15 × uint64 + 1 × uint64) | 93.75% | NVLink intra-node, mid-size messages |
 | `Simple` | full data + separate fence | ~100% | large messages, throughput |
 
-Idea behind LL and LL128: send the flag next to the data so the receiver can poll readiness with a single word load. No separate PCIe doorbell. The cost is efficiency loss. LL128 uses the NVLink cache line (128B) directly, giving up only 8B per line for the flag, which makes it the sweet spot for NVLink intra-node. The exact enable conditions are in §5.
+Idea behind LL and LL128: send the flag next to the data so the receiver can poll readiness with a single word load. No separate PCIe doorbell. The cost is efficiency loss. LL packs 16 B per fifo line as `union ncclLLFifoLine` = `uint32_t data1, flag1, data2, flag2`; LL128 uses the NVLink cache line (128 B) directly, giving up only 8 B per line for the flag, which makes it the sweet spot for NVLink intra-node. The exact enable conditions are in §5.
 
 ## 4. Algorithm Deep-dive
 
@@ -199,6 +200,8 @@ if (a == NCCL_ALGO_TREE && coll == ncclFuncAllReduce) {
 
 Why the `2 ×`. Just like Ring AllReduce splits into RS + AG, tree AllReduce splits into reduce-up + broadcast-down. The latency of one phase is (intra-node leg) + (inter-node tree $\log_2 N$), and that gets doubled.
 
+One detail of the formula. The theoretical depth of the analysis above is $2 \log p$ (over all ranks), but NCCL's cost formula uses **$\log_2 N$ (node count) only on the inter-node leg, while the intra-node leg is $(p_{node} - 1)$ linear**. NCCL simplifies the heuristic on the assumption that intra-node hops are short and largely concurrent. Not the textbook expression.
+
 ### 4.3 PAT, Parallel Aggregated Trees (NCCL 2.23+)
 
 Ring AllGather has latency $(p-1)\alpha$, growing linearly with $p$. PAT solves that. The base is a variant of the Bruck (1997) algorithm. Each round doubles the partner distance (1, 2, 4, 8, ...), and that pattern resembles the FFT (Cooley-Tukey 1965) butterfly diagram closely enough that the distributed computing literature also calls it the butterfly pattern. The NCCL code and docs themselves do not use the term; they just call it PAT.
@@ -213,7 +216,7 @@ _Figure 5. NCCL's PAT algorithm at 8 ranks. The Bruck binomial tree pattern, shi
 
 #### 4.3.1 Narrow Enable Conditions
 
-Why PAT is rarely seen. `ncclPatEnable` (`src/graph/tuning.cc:209`) requires three conditions all at once.
+Why PAT is rarely seen. `ncclPatEnable` (`src/graph/tuning.cc`, NCCL v2.30) requires three conditions all at once.
 
 ```c
 // src/graph/tuning.cc
@@ -309,19 +312,23 @@ Conditions.
 - Hopper / Blackwell GPU (compcap 9.0 / 10.0).
 - NVSwitch in the system (`system->nodes[NVS].count > 0`).
 - At least 2 channels.
-- Single node uses `NVLS`; 2+ nodes use `NVLS_TREE` (multi-node tree on top of NVLS).
+- **Single node: `NVLS` only** (`NVLS_TREE` is auto-disabled when `comm->nNodes == 1`).
+- **Multi-node + collnet enabled: both `NVLS` and `NVLS_TREE` survive**, and argmin picks based on message size.
+- **Multi-node + collnet disabled: `NVLS_TREE` only** (`NVLS` is auto-disabled on multi-node when collnet is off, `tuning.cc:476-479`).
 
-The simple cost expression is also a hallmark of NVLS.
+The cost expressions:
 
 ```c
-// src/graph/tuning.cc, NVLS latency
+// src/graph/tuning.cc, NVLS / NVLSTree latency
 if (a == NCCL_ALGO_NVLS) {
   comm->latencies[coll][a][p] = intraLat;
   if (nNodes > 1) comm->latencies[coll][a][p] += interLat;
+} else if (a == NCCL_ALGO_NVLS_TREE) {
+  comm->latencies[coll][a][p] += intraLat + 2 * log2i(nNodes) * interLat;
 }
 ```
 
-`α × 1` (intra) plus optionally `α × 1` (inter). The $p$ falls out of the formula. That is what NVSwitch multicast does. On 8-GPU H100 / H200 NVSwitch boxes, large AllReduce almost always picks NVLS automatically.
+NVLS: `α × 1` (intra) plus optionally `α × 1` (inter). The $p$ falls out of the formula. That is what NVSwitch multicast does. NVLSTree adds a multi-node tree's reduce-up + broadcast-down two-phase × $\log_2 N$ inter-hops on top of the NVLS intra term ($2 \log_2 N \cdot \alpha_{\text{inter}}$). On 8-GPU H100 / H200 NVSwitch boxes, large AllReduce almost always picks NVLS automatically.
 
 ### 4.5 CollNet Direct / Chain
 
@@ -351,13 +358,13 @@ struct ProtoSimple {  // NCCL_PROTO_SIMPLE = 2
   }
 };
 struct ProtoLL {      // NCCL_PROTO_LL = 0
-  // 16B line = 8B data + 8B flag, 50%
+  // 16B fifo line = (4B data + 4B flag) × 2, 50%
   __device__ static int calcBytePerStep() {
     return ncclShmem.comm.buffSizes[NCCL_PROTO_LL]/NCCL_STEPS/2;
   }
 };
 struct ProtoLL128 {   // NCCL_PROTO_LL128 = 1
-  // 128B NVLink line, 120B data, 93.75%
+  // 128B fifo line = 120B data + 8B flag, 93.75%
   __device__ static int calcBytePerStep() {
     return (ncclShmem.comm.buffSizes[NCCL_PROTO_LL128]/NCCL_STEPS)
            * NCCL_LL128_DATAELEMS / NCCL_LL128_LINEELEMS;
@@ -365,7 +372,7 @@ struct ProtoLL128 {   // NCCL_PROTO_LL128 = 1
 };
 ```
 
-LL128 only enables on transports with guaranteed atomicity. The conditions are involved (`src/graph/tuning.cc:486`).
+LL128 only enables on transports with guaranteed atomicity. The conditions are involved (`src/graph/tuning.cc`, NCCL v2.30).
 
 ```c
 // src/graph/tuning.cc, LL128 enable gating
@@ -396,7 +403,7 @@ When a user calls a collective (e.g. `ncclAllReduce(buf, ..., count, dtype, op, 
 
 ### 6.1 Init: Build the α/β Table
 
-`ncclTopoTuneModel` (`src/graph/tuning.cc:238`) fills two tables at communicator init time, one cell per (collective, algorithm, protocol).
+`ncclTopoTuneModel` (`src/graph/tuning.cc`, NCCL v2.30) fills two tables at communicator init time, one cell per (collective, algorithm, protocol).
 
 - `comm->bandwidths[coll][algo][proto]` (GB/s)
 - `comm->latencies[coll][algo][proto]` (µs)
@@ -471,11 +478,11 @@ for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
 }
 ```
 
-Disabled cells get `comm->bandwidths[c][a][p] = 0` (`tuning.cc:504`). The argmin step later drops them.
+Disabled cells get `comm->bandwidths[c][a][p] = 0`. The argmin step later drops them.
 
 ### 6.4 Per-call Argmin
 
-When a user calls `ncclAllReduce(...)`, a collective task is created and `topoGetAlgoInfo` (`src/enqueue.cc:1940`) takes the message size and group size and finds the argmin in the §1 7 x 3 table.
+When a user calls `ncclAllReduce(...)`, a collective task is created and `topoGetAlgoInfo` (`src/enqueue.cc`, NCCL v2.30) takes the message size and group size and finds the argmin in the §1 7 x 3 table.
 
 ```c
 // src/enqueue.cc (excerpt)
@@ -503,7 +510,7 @@ for (int a=0; a<NCCL_NUM_ALGORITHMS; a++)
 `ncclTopoGetAlgoTime` itself is one line.
 
 ```c
-// src/graph/tuning.cc:609
+// src/graph/tuning.cc (NCCL v2.30)
 *time = lat * latCount + nBytes / (1000 * bw);
 ```
 
@@ -511,7 +518,7 @@ $T = (\text{lat} \times \text{latCount}) + \frac{\text{nBytes}}{1000 \times \tex
 
 ### 6.5 Channel and Chunk Size
 
-Once (algo, proto) is set, the same cost model decides nChannels and chunkSize. CollNet has its own search, NVLS clamps to `comm->nvlsChannels`, and Ring / Tree shrink nc and then nt until `nBytes < nc x nt x threadThreshold` is satisfied.
+Once (algo, proto) is set, the same cost model decides nChannels and chunkSize. CollNet has its own search, NVLS clamps to `comm->nvlsChannels`, and Ring / Tree shrink nc and then nt until `nBytes < nc x nt x threadThreshold` is satisfied. The channel / chunk decision details for each algorithm (especially CollNet's own search logic) are a topic on their own; one paragraph here.
 
 ### 6.6 The Whole Picture
 
@@ -522,7 +529,7 @@ flowchart TD
     C --> D[(comm-&gt;bandwidths<br/>comm-&gt;latencies)]
 
     E[ncclAllReduce call] --> F[message size + group size]
-    F --> G[topoGetAlgoInfo<br/>compute α + n/β<br/>for every algo×proto cell]
+    F --> G[topoGetAlgoInfo<br/>compute lat + bytes/bw<br/>for every algo×proto cell]
     D --> G
     G --> H[argmin algo, proto]
     H --> I[decide nChannels, chunkSize]
@@ -531,64 +538,60 @@ flowchart TD
 
 This is the full host-side flow that turns a tensor size into an algorithm and protocol. Build the table once at init, then find the argmin per call given the size.
 
-## 7. Numerical Example
+## 7. Watching It Live with NCCL_DEBUG_SUBSYS=TUNING
 
-Plugging the formulas above and the §6.2 table into concrete environments shows where ring vs tree vs NVLS actually diverge.
+Reading NCCL's own log is faster than calculating from the model when you want to know what table the §6 selection machine actually builds and which cell it picks. On a 2x RTX 5060 Ti box (consumer GPU, P2P disabled, SHM transport, NCCL 2.28.9), the four lines below get §6.1's init table and §6.4's dispatch printed verbatim.
 
-### 7.1 Scenario A: 8 H100 GPUs, Single Node (NVLink + NVSwitch)
+```bash
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,TUNING,GRAPH
+torchrun --nproc-per-node=2 ./mini_allreduce.py
+```
 
-Assumptions.
+### 7.1 Init: α/β Table
 
-- $p = 8$, single node, NVSwitch.
-- NVLink per-direction $\approx 450$ GB/s, aggregate intra-node $B \approx 900$ GB/s.
-- $\alpha_{\text{intra}} \approx 1$ µs (one NVLink hop, the PAT entry of the hwLat table).
-- baseLat (Tree, Simple) $= 8.4$ µs, baseLat (Ring, Simple) $= 8.4$ µs.
+The α/β table NCCL prints at communicator init time (5 collective × 7 algorithm × 3 protocol). AllReduce row only (`lat µs / bw GB/s`):
 
-Approximate $T(K)$ per algorithm (Simple protocol):
+| | Tree | Ring | CollNetDirect | CollNetChain | NVLS / NVLSTree / PAT |
+|---|---|---|---|---|---|
+| LL / LL128 / Simple | 8.8 / 17.8 / 16.4 | 8.6 / 19.0 / 19.8 | 0.8 / 0.8 / 39.2 | 0 / 0 / 35.6 | 0 / 0 / 0 |
+| bw (GB/s) | 0 / 0 / 0 | 0.1 / 0 / 0.1 | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
 
-$$T_{\text{ring}}(K) = 2(p-1)\alpha_{\text{intra}} + \frac{2(p-1)}{p} \cdot \frac{K}{B} \approx 14\,\mu s + \frac{1.75 K}{B}$$
+How to read this.
 
-$$T_{\text{tree}}(K) \approx 2 \log_2 p \cdot \alpha_{\text{intra}} + \frac{2K}{B} \approx 6\,\mu s + \frac{2K}{B}$$
+- **bw = 0 means the cell was disabled by an eligibility or enable filter**. Only Ring LL and Ring Simple survive in this environment.
+- NVLS / NVLSTree → no NVSwitch (consumer cards).
+- PAT → `nNodes (1) ≠ nRanks (2)`.
+- Tree → graph search cannot build a Tree pattern on a single node 2 GPU consumer setup with P2P disabled.
+- CollNet → no SHARP NIC.
+- Ring LL128 → `typeIntra <= PATH_NVB` (NVLink direct only) is not satisfied.
+- **bw = 0.1 GB/s is NCCL's conservative default for the SYS path**. It is recorded directly in the init-time graph diagnostic line: `Pattern 4, crossNic 0, nChannels 1, bw 0.100000/0.100000, type SYS/SYS`. The fallback for consumer cards with P2P disabled.
 
-$$T_{\text{NVLS}}(K) \approx \alpha_{\text{intra}} + \frac{K}{0.85 B} \approx 1\,\mu s + \frac{1.18 K}{B}$$
+### 7.2 Per-call Dispatch Lines
 
-| $K$ | Ring | Tree | NVLS |
-|---|---|---|---|
-| 1 MB | $\sim 16$ µs | $\sim 8$ µs | $\sim 2$ µs |
-| 16 MB | $\sim 45$ µs | $\sim 42$ µs | $\sim 22$ µs |
-| 256 MB | $\sim 512$ µs | $\sim 575$ µs | $\sim 335$ µs |
+Calling AllReduce at three sizes prints one line per call (the main purpose of `NCCL_DEBUG_SUBSYS=TUNING`).
 
-NVLS wins at every size on this machine. As expected, large AllReduce on H100 NVSwitch usually goes to NVLS.
+```
+NCCL INFO AllReduce: 1048576   Bytes -> Algo RING proto SIMPLE channel{Lo..Hi}={0..1}
+NCCL INFO AllReduce: 16777216  Bytes -> Algo RING proto SIMPLE channel{Lo..Hi}={0..1}
+NCCL INFO AllReduce: 268435456 Bytes -> Algo RING proto SIMPLE channel{Lo..Hi}={0..1}
+```
 
-### 7.2 Scenario B: 8 nodes x 8 GPU IB (no NVLS)
+Ring Simple at every size. The surviving candidates were Ring LL (lat 8.6 µs) and Ring Simple (lat 19.8 µs), but LL's **50% data efficiency** halves the effective bw. Past about 1 MB, the bytes/bw difference dominates the 11 µs lat gap, so argmin picks Simple.
 
-Assumptions.
+### 7.3 Measured vs cost model
 
-- $P = 64$, $p_{\text{node}} = 8$, 8 nodes.
-- IB per-direction $\approx 25$ GB/s, $\alpha_{\text{ib}} \approx 5$ µs (a portion of the 14 µs in NET ring Simple in the hwLat table).
-- $\alpha_{\text{intra}} \approx 1$ µs.
+| K | Measured (5-run mean) | NCCL cost formula (`lat + nBytes/(1000·bw)`) |
+|---:|---:|---:|
+| 1 MiB | **156.6 µs** | $19.8 + 1{,}048{,}576 / (1000 \cdot 0.1) \approx 10{,}506$ µs |
+| 16 MiB | **1.38 ms** | $\approx 168$ ms |
+| 256 MiB | **20.7 ms** | $\approx 2.7$ s |
 
-Cross-node cost dominates, so ring's $2(P-1) = 126$ steps become a real burden. Double Binary Tree compresses that into $2 \log_2 8 = 6$ inter-node steps (the tree latency formula in §4.2).
+NCCL's SYS-path default bw (0.1 GB/s) is a very conservative lower bound, so the absolute values diverge from measurement by orders of magnitude. **What matters is that argmin only needs the relative ordering, so practical algorithm selection still works**. On NVSwitch + NVLink (H100 / H200), the same command brings NVLS / NVLSTree alive and bw lands in the 100–900 GB/s range, pushing Ring out — methodology unchanged.
 
-| $K$ | Ring | Tree (Double Binary) |
-|---|---|---|
-| 1 MB | $\sim 700$ µs | $\sim 100$ µs |
-| 16 MB | $\sim 2.5$ ms | $\sim 1.4$ ms |
-| 256 MB | $\sim 35$ ms | $\sim 22$ ms |
+### 7.4 Summit Measurements: Double Binary Tree at Large Scale
 
-Tree is roughly 7x faster at small $K$. Even at large $K$, the Sanders trick keeps tree ahead of ring. This is why NCCL picks Tree often for multi-node AllReduce.
-
-### 7.3 Summary
-
-Selection patterns by scenario.
-
-- **Single-node H100 NVSwitch**: large AllReduce uses NVLS, small ones use Tree or NVLS.
-- **Multi-node IB**: large AllReduce uses Tree (Double Binary), small ones use Tree, AllGather and ReduceScatter use Ring or PAT (with 1 GPU per node).
-- **InfiniBand SHARP NIC**: CollNetDirect / Chain push Tree out of the picture.
-
-(plot placeholder) Plotting the table above with Python and matplotlib, with ring / tree / NVLS curves on the same axes, makes the two crossovers visible. In scenario A, NVLS is always lowest. In scenario B, the crossover sits between small-$K$ tree and large-$K$ ring.
-
-That is the analysis. The actual measurements look like this. Here is how NCCL 2.4's Double Binary Tree scaled on Summit up to 24,576 GPUs.
+The above is a 2-GPU lower bound. Scale-out is where Double Binary Tree's value shows up. NVIDIA's measurements on Summit.
 
 ![NCCL bus bandwidth on Summit, up to 24,576 GPUs](/assets/img/posts/nccl-algorithms/Summit-BW.png){: width="640"}
 _Figure 6. Bus bandwidth stays nearly flat all the way to 24K GPUs on Summit. The combination of Double Binary Tree and multi-channel ring keeps bandwidth utilization high even at large scale._
@@ -612,18 +615,24 @@ NCCL_ALGO="ring,collnetdirect;allreduce:tree,collnetdirect"
 NCCL_PROTO="^LL128"
 ```
 
-The flow: `parseList` builds a bitmask, and disabled cells get bandwidth zeroed (`tuning.cc:504`). The argmin then drops them.
+The flow: `parseList` builds a bitmask, and disabled cells get bandwidth zeroed. The argmin then drops them.
 
-### 8.2 Determinism
-
-A different reduction tree gives a different floating-point summation order, which changes the low bits.
+A pitfall. `NCCL_ALGO=Tree` alone breaks Broadcast / Reduce / AllGather / ReduceScatter — Tree is only eligible for AllReduce (`tuning.cc::ncclTopoTuneModel`), but `NCCL_ALGO=Tree` forces Tree on every collective and disables the rest. The result is that Broadcast and friends end up with all candidate cells at bw=0. The safe form:
 
 ```bash
-NCCL_ALGO=Tree
+NCCL_ALGO="ring;allreduce:tree"   # other collectives fall back to Ring
+```
+
+### 8.2 Algo / Proto Pinning as a Reproducibility Aid
+
+Floating-point addition is not associative, so a different reduction order changes the low bits. NCCL's main source of non-determinism is the algorithm switching with message size. So
+
+```bash
+NCCL_ALGO="ring;allreduce:tree"
 NCCL_PROTO=Simple
 ```
 
-Pinning algorithm and protocol with these makes the reduction order deterministic. In bf16 environments the difference can be non-trivial, and this pinning is common when verifying reproducibility.
+pinning (algo, proto) stabilizes the reduction order within that choice and gets you **close to bitwise reproducibility**. True bitwise determinism requires the channel count, NCCL version, topology, and rank mapping all to match; NCCL itself has no "deterministic" flag. Common trick when verifying bf16 training reproducibility.
 
 ### 8.3 NCCL_DEBUG_SUBSYS=TUNING
 
@@ -685,7 +694,7 @@ PyTorch profiler trace kernel names carry the same information: `ncclKernel_AllR
 
 ## Reference
 
-- Hu, Z. et al. "Demystifying NCCL: An In-depth Analysis of GPU Communication Protocols and Algorithms." arXiv:2507.04786, 2026.
+- Hu, Z. et al. "Demystifying NCCL: An In-depth Analysis of GPU Communication Protocols and Algorithms." arXiv:2507.04786, 2025 (analyzes NCCL 2.19.1; this post cites NCCL v2.30 source, so some constants and branches differ).
 - Sanders, P., Speck, J., Träff, J.L. "Full Bandwidth Broadcast, Reduction and Scan with Only Two Trees." PVM/MPI, 2007.
 - Thakur, R., Rabenseifner, R., Gropp, W. "Optimization of Collective Communication Operations in MPICH." IJHPCA, 2005.
 - Bruck, J. et al. "Efficient Algorithms for All-to-All Communications in Multiport Message-Passing Systems." IEEE TPDS, 1997.

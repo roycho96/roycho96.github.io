@@ -20,9 +20,9 @@ mermaid: true
 
 `AllReduce` 의 **의미** (semantics) 는 한 줄로 정해진다. "모든 rank 의 값을 합쳐 모든 rank 가 결과를 받는다." 그걸 **어떻게** 수행하느냐는 별개의 층위다. 어느 schedule 이 빠른지는 메시지 크기, rank 수, topology, hardware 가 다 결정한다.
 
-그래서 NCCL 은 collective 호출이 들어올 때마다 후보 알고리즘 7 개와 protocol 3 개로 7 × 3 = 21 칸짜리 표를 만든다. 셀마다 예상 실행 시간을 cost model 로 계산하고 가장 짧은 셀을 고른다 (argmin, 최솟값을 주는 위치).
+그래서 NCCL 은 communicator init 시 후보 알고리즘 7 개 × protocol 3 개 = 21 셀짜리 표를 conceptual maximum 으로 들고 시작한다. 셀마다 예상 실행 시간을 cost model 로 계산하고 가장 짧은 셀을 고른다 (argmin, 최솟값을 주는 위치).
 
-표의 모든 칸을 다 쓰지는 않는다. eligibility 조건이 셀 대부분을 미리 빼버리고 시작한다. AllReduce 한정으로 보면 21 셀 중 실제 평가되는 건 10 셀 (PAT 가 AllReduce 자체에서 제외 3 셀, NVLS / NVLSTree / CollNet 이 Simple protocol 만 받음 8 셀). 그래도 골격은 같다. 표 + argmin.
+eligibility 조건이 셀 대부분을 미리 빼버리고 시작한다. AllReduce 한정으로 보면 21 셀 중 실제 평가되는 건 최대 10 셀 (PAT 가 AllReduce 자체에서 제외 3 셀, NVLS / NVLSTree / CollNet 이 Simple protocol 만 받음 8 셀). 골격은 같다. 표 + argmin.
 
 이 글의 목표는 그 표가 어떻게 만들어지고, 호스트가 사용자의 tensor 크기를 보고 어떤 (algorithm, protocol) 을 고르는지를 NCCL master 코드로 따라가는 것.
 
@@ -62,9 +62,10 @@ const char* ncclAlgoStr[NCCL_NUM_ALGORITHMS] = {
 |---|---|---|---|
 | `Ring` | nearest-neighbor pipeline | 거의 모든 collective | per-rank traffic $\sim 2n$ |
 | `Tree` | Double Binary Tree (§4.2) | AllReduce 만 | tree latency + ring BW |
-| `CollNetDirect` / `CollNetChain` | NVIDIA SHARP (in-network reduce) | AllReduce, RS, AG | IB SHARP NIC 필요 |
-| `NVLS` | NVSwitch multicast + reduce | AllReduce 등 | Hopper+, NVSwitch 필요 |
-| `NVLSTree` | NVLS + multi-node tree | AllReduce | 2 노드 이상 |
+| `CollNetDirect` | collective network transport (in-network reduce) | AllReduce, AG, RS | SHARP plugin 환경에서 의미 |
+| `CollNetChain` | collective network transport, chain layout | AllReduce 만 | 동상 |
+| `NVLS` | NVSwitch multicast + reduce | AllReduce, AG, RS | Hopper+, NVSwitch 필요 |
+| `NVLSTree` | NVLS + multi-node tree | AllReduce | multi-node, NVSwitch + IB |
 | `PAT` | Bruck 변형 (§4.3) | AllGather, ReduceScatter | 2.23+, 1-GPU/노드 |
 
 Eligibility 가 어떤 collective 에 어떤 algorithm 이 후보인지를 일찍 자른다 (`src/graph/tuning.cc::ncclTopoTuneModel`):
@@ -78,7 +79,7 @@ if ((coll == ncclFuncReduceScatter || coll == ncclFuncAllGather)
 if (coll == ncclFuncAllReduce && a == NCCL_ALGO_PAT) continue;
 ```
 
-요지: Broadcast / Reduce 는 Ring 만, AllGather / ReduceScatter 는 {Ring, PAT, NVLS, CollNet_Direct}, AllReduce 는 PAT 빼고 다.
+요지: Broadcast / Reduce 는 Ring 만, AllGather / ReduceScatter 는 {Ring, PAT, NVLS, CollNetDirect}, AllReduce 는 PAT 빼고 다. **CollNetChain 은 AllReduce 전용**.
 
 ### 3.2 Topology Pattern 6 종
 
@@ -100,13 +101,13 @@ BALANCED / SPLIT 은 NIC traffic 을 두 GPU 에 나눠 PCIe / NVLink 병목을 
 
 같은 algorithm 도 wire format 이 셋. data:flag 비율이 다르다.
 
-| Protocol | Cache line | data 효율 | 적합 |
+| Protocol | Fifo line | data 효율 | 적합 |
 |---|---|---|---|
-| `LL` | 8B (4B data + 4B flag) | 50% | 짧은 메시지, latency |
-| `LL128` | 128B (120B data + 8B flag) | 93.75% | NVLink intra-node 중간 메시지 |
+| `LL` | 16B fifo line = (4B data + 4B flag) × 2 | 50% | 짧은 메시지, latency |
+| `LL128` | 128B fifo line = 120B data + 8B flag (15 × uint64 + 1 × uint64) | 93.75% | NVLink intra-node 중간 메시지 |
 | `Simple` | full data + 별도 fence | ~100% | 큰 메시지, throughput |
 
-LL / LL128 의 핵심: data 옆에 flag 를 같이 보내서 receiver 가 단일 word load 로 ready 폴링 가능. PCIe doorbell 따로 안 받음. 그 대가가 효율 손실. LL128 은 NVLink cache line 단위 (128B) 를 그대로 활용해서 line 당 8B 만 flag 에 양보. 그래서 NVLink intra-node 에서 sweet spot. Enable 의 정확한 조건은 §5.
+LL / LL128 의 핵심: data 옆에 flag 를 같이 보내서 receiver 가 단일 word load 로 ready 폴링 가능. PCIe doorbell 따로 안 받음. 그 대가가 효율 손실. LL 의 한 fifo line 은 16 B 단위 (`union ncclLLFifoLine` = `uint32_t data1, flag1, data2, flag2`), LL128 은 NVLink cache line 단위 (128 B) 를 그대로 활용해 line 당 8 B 만 flag 에 양보. 그래서 NVLink intra-node 에서 sweet spot. Enable 의 정확한 조건은 §5.
 
 ## 4. Algorithm Deep-dive
 
@@ -199,6 +200,8 @@ if (a == NCCL_ALGO_TREE && coll == ncclFuncAllReduce) {
 
 `2 ×` 의 의미. Ring AllReduce 가 RS + AG 두 phase 인 것처럼, tree AllReduce 도 reduce-up + broadcast-down 두 phase. 한 phase 의 latency 가 (intra-node leg) + (inter-node 트리 $\log_2 N$) 이라 그게 두 배.
 
+식의 디테일에서 한 가지 주의. 위 분석의 이론적 깊이는 $2 \log p$ (전체 rank 수) 지만 NCCL 의 cost 식은 **inter-node 만 $\log_2 N$ (노드 수), intra-node 는 $(p_{node} - 1)$ linear** 로 들어간다. 이는 NCCL 이 "노드 안은 어차피 짧고 거의 동시 다발" 이라 보고 단순화한 heuristic. 이론치 그대로가 아니다.
+
 ### 4.3 PAT — Parallel Aggregated Trees (NCCL 2.23+)
 
 Ring AllGather 의 latency 가 $(p-1)\alpha$ 로 큰 $p$ 에서 선형으로 늘어난다는 게 PAT 가 푸는 문제. Bruck (1997) 의 algorithm 변형이 base. Round 마다 partner 가 1, 2, 4, 8 식으로 두 배씩 늘어나는 dataflow 인데, 이 패턴이 FFT (Cooley-Tukey 1965) 의 butterfly diagram 과 닮아서 분산 컴퓨팅 문헌에서는 butterfly pattern 이라고도 부른다. NCCL 자체 코드 / docs 에는 이 용어가 등장하지 않고 PAT 라는 이름으로만 들고 있다.
@@ -213,7 +216,7 @@ _Figure 5. NCCL 의 PAT algorithm 을 8 rank 에서 본 모습. Bruck 의 binomi
 
 #### 4.3.1 Enable 조건이 좁다
 
-PAT 가 잘 안 보이는 이유. `ncclPatEnable` (`src/graph/tuning.cc:209`) 가 세 조건을 다 요구한다.
+PAT 가 잘 안 보이는 이유. `ncclPatEnable` (`src/graph/tuning.cc`, NCCL v2.30 기준) 가 세 조건을 다 요구한다.
 
 ```c
 // src/graph/tuning.cc 발췌
@@ -309,19 +312,23 @@ static const float nvlsEfficiency[NCCL_NUM_COMPCAPS] = {
 - Hopper / Blackwell GPU (compcap 9.0 / 10.0).
 - NVSwitch 노드 (`system->nodes[NVS].count > 0`).
 - 채널 ≥ 2 개.
-- 단일 노드면 `NVLS`, 2 노드 이상이면 `NVLS_TREE` (multi-node tree 가 NVLS 위에 얹힘).
+- **단일 노드: `NVLS` 만 후보** (`NVLS_TREE` 는 `comm->nNodes == 1` 에서 자동 disable).
+- **Multi-node + collnet enabled: `NVLS` 와 `NVLS_TREE` 공존**, argmin 이 메시지 크기로 가른다.
+- **Multi-node + collnet disabled: `NVLS_TREE` 만** (`NVLS` 는 multi-node 에서 collnet 없으면 자동 disable, `tuning.cc:476-479`).
 
 Cost 식이 단순한 것도 NVLS 의 특징.
 
 ```c
-// src/graph/tuning.cc 발췌 — NVLS latency
+// src/graph/tuning.cc 발췌 — NVLS / NVLSTree latency
 if (a == NCCL_ALGO_NVLS) {
   comm->latencies[coll][a][p] = intraLat;
   if (nNodes > 1) comm->latencies[coll][a][p] += interLat;
+} else if (a == NCCL_ALGO_NVLS_TREE) {
+  comm->latencies[coll][a][p] += intraLat + 2 * log2i(nNodes) * interLat;
 }
 ```
 
-`α × 1` (intra) + 옵션으로 `α × 1` (inter). $p$ 가 식에서 사라진다. 이게 NVSwitch multicast 의 본질. 8-GPU H100 / H200 NVSwitch 머신에서 큰 AllReduce 는 거의 자동으로 NVLS 가 골라진다.
+NVLS: `α × 1` (intra) + 옵션으로 `α × 1` (inter). $p$ 가 식에서 사라진다. 이게 NVSwitch multicast 의 본질. NVLSTree: NVLS 의 intra 항에 multi-node tree 의 reduce-up + broadcast-down 두 phase × $\log_2 N$ inter-hop 이 추가 (`2 \log_2 N \cdot \alpha_{\text{inter}}$). 8-GPU H100 / H200 NVSwitch 머신에서 큰 AllReduce 는 거의 자동으로 NVLS 가 골라진다.
 
 ### 4.5 CollNet Direct / Chain
 
@@ -351,13 +358,13 @@ struct ProtoSimple {  // NCCL_PROTO_SIMPLE = 2
   }
 };
 struct ProtoLL {      // NCCL_PROTO_LL = 0
-  // 16B line = 8B data + 8B flag → 50%
+  // 16B fifo line = (4B data + 4B flag) × 2 → 50%
   __device__ static int calcBytePerStep() {
     return ncclShmem.comm.buffSizes[NCCL_PROTO_LL]/NCCL_STEPS/2;
   }
 };
 struct ProtoLL128 {   // NCCL_PROTO_LL128 = 1
-  // 128B NVLink line 중 120B data → 93.75%
+  // 128B fifo line = 120B data + 8B flag → 93.75%
   __device__ static int calcBytePerStep() {
     return (ncclShmem.comm.buffSizes[NCCL_PROTO_LL128]/NCCL_STEPS)
            * NCCL_LL128_DATAELEMS / NCCL_LL128_LINEELEMS;
@@ -365,7 +372,7 @@ struct ProtoLL128 {   // NCCL_PROTO_LL128 = 1
 };
 ```
 
-LL128 은 atomicity 가 보장되는 transport 에서만 enable 된다. 조건이 꽤 까다롭다 (`src/graph/tuning.cc:486`).
+LL128 은 atomicity 가 보장되는 transport 에서만 enable 된다. 조건이 꽤 까다롭다 (`src/graph/tuning.cc`, NCCL v2.30 기준).
 
 ```c
 // src/graph/tuning.cc 발췌 — LL128 enable gating
@@ -396,7 +403,7 @@ PATH 타입의 정확한 의미는 ①편 §4.5 참고. 가까운 순서: NVL > 
 
 ### 6.1 Init: α/β 테이블 빌드
 
-`ncclTopoTuneModel` (`src/graph/tuning.cc:238`) 이 communicator init 시 모든 (collective, algorithm, protocol) 셀에 대해 두 표를 채운다.
+`ncclTopoTuneModel` (`src/graph/tuning.cc`, NCCL v2.30 기준) 이 communicator init 시 모든 (collective, algorithm, protocol) 셀에 대해 두 표를 채운다.
 
 - `comm->bandwidths[coll][algo][proto]` (GB/s)
 - `comm->latencies[coll][algo][proto]` (µs)
@@ -475,7 +482,7 @@ for (int a=0; a<NCCL_NUM_ALGORITHMS; a++) {
 
 ### 6.4 Per-call: argmin
 
-사용자가 `ncclAllReduce(...)` 를 부르면 collective task 가 만들어지고, `topoGetAlgoInfo` (`src/enqueue.cc:1940`) 가 message size + group size 를 보고 §1 의 7 × 3 표에서 argmin 을 찾는다.
+사용자가 `ncclAllReduce(...)` 를 부르면 collective task 가 만들어지고, `topoGetAlgoInfo` (`src/enqueue.cc`, NCCL v2.30 기준) 가 message size + group size 를 보고 §1 의 7 × 3 표에서 argmin 을 찾는다.
 
 ```c
 // src/enqueue.cc 발췌 (요지)
@@ -503,7 +510,7 @@ for (int a=0; a<NCCL_NUM_ALGORITHMS; a++)
 `ncclTopoGetAlgoTime` 자체는 한 줄.
 
 ```c
-// src/graph/tuning.cc:609 발췌
+// src/graph/tuning.cc 발췌 (NCCL v2.30 기준)
 *time = lat * latCount + nBytes / (1000 * bw);
 ```
 
@@ -511,7 +518,7 @@ $T = (\text{lat} \times \text{latCount}) + \frac{\text{nBytes}}{1000 \times \tex
 
 ### 6.5 Channel / chunk 사이즈
 
-(algo, proto) 가 정해지면 같은 cost model 위에서 nChannels 와 chunkSize 도 결정. CollNet 은 자체 search, NVLS 는 `comm->nvlsChannels` 로 클램프, Ring / Tree 는 `nBytes < nc × nt × threadThreshold` 가 될 때까지 nc 를 줄이고 그 다음 nt 를 줄인다.
+(algo, proto) 가 정해지면 같은 cost model 위에서 nChannels 와 chunkSize 도 결정. CollNet 은 자체 search, NVLS 는 `comm->nvlsChannels` 로 클램프, Ring / Tree 는 `nBytes < nc × nt × threadThreshold` 가 될 때까지 nc 를 줄이고 그 다음 nt 를 줄인다. 각 algorithm 의 channel / chunk 결정 디테일 (특히 CollNet 의 자체 search 로직) 은 별도로 다룰 만한 분량이라 여기선 한 단락으로 끝낸다.
 
 ### 6.6 정리 그림
 
@@ -522,7 +529,7 @@ flowchart TD
     C --> D[(comm-&gt;bandwidths<br/>comm-&gt;latencies)]
 
     E[ncclAllReduce 호출] --> F[message size + group size]
-    F --> G[topoGetAlgoInfo<br/>모든 algo×proto 셀에 대해<br/>α + n/β 계산]
+    F --> G[topoGetAlgoInfo<br/>모든 algo×proto 셀에 대해<br/>lat + bytes/bw 계산]
     D --> G
     G --> H[argmin algo, proto]
     H --> I[nChannels, chunkSize 결정]
@@ -531,64 +538,60 @@ flowchart TD
 
 호스트가 tensor 크기를 보고 어떤 algorithm 으로 launch 할지 결정하는 흐름이 이 그림이다. Init 시 한 번 빌드, per-call 마다 size 보고 argmin.
 
-## 7. Numerical Example
+## 7. NCCL_DEBUG_SUBSYS=TUNING 으로 직접 보기
 
-위 수식과 §6.2 의 표를 구체 환경에 박아 ring vs tree vs NVLS 가 어디서 갈리는지 본다.
+§6 의 selection 머신이 실제로 어떤 표를 만들고 어떤 셀을 고르는지는 모델 계산보다 NCCL 자신의 로그를 보는 게 빠르다. RTX 5060 Ti × 2 (consumer GPU, P2P 비활성, SHM transport, NCCL 2.28.9) 환경에서 다음 4 줄이면 §6.1 의 init 테이블 + §6.4 의 dispatch 가 그대로 찍힌다.
 
-### 7.1 시나리오 A: 8-GPU H100 단일 노드 (NVLink + NVSwitch)
+```bash
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,TUNING,GRAPH
+torchrun --nproc-per-node=2 ./mini_allreduce.py
+```
 
-가정.
+### 7.1 Init: α/β 테이블
 
-- $p = 8$, single node, NVSwitch.
-- NVLink per-direction $\approx 450$ GB/s, aggregate intra-node $B \approx 900$ GB/s.
-- $\alpha_{\text{intra}} \approx 1$ µs (NVLink 한 hop, hwLat 표의 PAT 항).
-- baseLat (Tree, Simple) $= 8.4$ µs, baseLat (Ring, Simple) $= 8.4$ µs.
+NCCL 이 communicator init 시 출력하는 α/β 표 (5 collective × 7 algorithm × 3 protocol). AllReduce 행만 발췌하면 (`lat µs / bw GB/s`):
 
-각 algorithm 의 $T(K)$ 근사 (Simple protocol 기준):
+| | Tree | Ring | CollNetDirect | CollNetChain | NVLS / NVLSTree / PAT |
+|---|---|---|---|---|---|
+| LL / LL128 / Simple | 8.8 / 17.8 / 16.4 | 8.6 / 19.0 / 19.8 | 0.8 / 0.8 / 39.2 | 0 / 0 / 35.6 | 0 / 0 / 0 |
+| bw (GB/s) | 0 / 0 / 0 | 0.1 / 0 / 0.1 | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 0 / 0 |
 
-$$T_{\text{ring}}(K) = 2(p-1)\alpha_{\text{intra}} + \frac{2(p-1)}{p} \cdot \frac{K}{B} \approx 14\,\mu s + \frac{1.75 K}{B}$$
+읽는 법.
 
-$$T_{\text{tree}}(K) \approx 2 \log_2 p \cdot \alpha_{\text{intra}} + \frac{2K}{B} \approx 6\,\mu s + \frac{2K}{B}$$
+- **bw = 0 = eligibility 또는 enable 필터로 disable 된 셀**. 표에서 살아남은 것은 Ring LL / Ring Simple 뿐.
+- NVLS / NVLSTree → NVSwitch 없는 consumer 카드.
+- PAT → `nNodes (1) ≠ nRanks (2)`.
+- Tree → 단일 노드 2 GPU 에서 graph search 가 Tree pattern 을 못 만듦 (consumer 카드 + P2P 비활성 환경의 한계).
+- CollNet → SHARP NIC 없음.
+- Ring LL128 → `typeIntra <= PATH_NVB` 조건 (NVLink 직결만) 이 무너짐.
+- **bw = 0.1 GB/s 는 NCCL 의 SYS path 보수적 기본값**. 같은 init 단계의 graph 진단 로그에 그대로 박혀 있다. `Pattern 4, crossNic 0, nChannels 1, bw 0.100000/0.100000, type SYS/SYS`. consumer 카드에 P2P 가 비활성된 경우의 fallback.
 
-$$T_{\text{NVLS}}(K) \approx \alpha_{\text{intra}} + \frac{K}{0.85 B} \approx 1\,\mu s + \frac{1.18 K}{B}$$
+### 7.2 Per-call: dispatch 라인
 
-| $K$ | Ring | Tree | NVLS |
-|---|---|---|---|
-| 1 MB | $\sim 16$ µs | $\sim 8$ µs | $\sim 2$ µs |
-| 16 MB | $\sim 45$ µs | $\sim 42$ µs | $\sim 22$ µs |
-| 256 MB | $\sim 512$ µs | $\sim 575$ µs | $\sim 335$ µs |
+세 사이즈로 AllReduce 를 부르면 NCCL 은 매번 한 줄을 찍는다 (`NCCL_DEBUG_SUBSYS=TUNING` 의 본 목적).
 
-이 머신에서는 NVLS 가 모든 size 에서 우세. 예상대로 H100 NVSwitch 환경의 큰 AllReduce 는 거의 NVLS 로 간다.
+```
+NCCL INFO AllReduce: 1048576   Bytes -> Algo RING proto SIMPLE channel{Lo..Hi}={0..1}
+NCCL INFO AllReduce: 16777216  Bytes -> Algo RING proto SIMPLE channel{Lo..Hi}={0..1}
+NCCL INFO AllReduce: 268435456 Bytes -> Algo RING proto SIMPLE channel{Lo..Hi}={0..1}
+```
 
-### 7.2 시나리오 B: 8 노드 × 8 GPU IB (NVLS 없음)
+전 사이즈에서 **Ring Simple**. 표에서 살아있는 후보는 Ring LL (lat 8.6 µs) / Ring Simple (lat 19.8 µs) 둘인데 LL 의 **50 % data efficiency** 가 effective bw 를 절반으로 깎는다. 1 MB 정도 이상 메시지에선 lat 차이 (11 µs) 보다 bytes/bw 차이가 압도적이라 argmin 이 Simple 로 쏠린다.
 
-가정.
+### 7.3 실측 vs cost model
 
-- $P = 64$, $p_{\text{node}} = 8$, 8 노드.
-- IB per-direction $\approx 25$ GB/s, $\alpha_{\text{ib}} \approx 5$ µs (hwLat 의 NET ring Simple = 14 µs 의 일부).
-- $\alpha_{\text{intra}} \approx 1$ µs.
+| K | 실측 (5 회 평균) | NCCL cost 식 (`lat + nBytes/(1000·bw)`) |
+|---:|---:|---:|
+| 1 MiB | **156.6 µs** | $19.8 + 1{,}048{,}576 / (1000 \cdot 0.1) \approx 10{,}506$ µs |
+| 16 MiB | **1.38 ms** | $\approx 168$ ms |
+| 256 MiB | **20.7 ms** | $\approx 2.7$ s |
 
-Cross-node 비용이 지배적이라 ring 의 $2(P-1) = 126$ step 이 부담이다. Double Binary Tree 가 이 부담을 $2 \log_2 8 = 6$ inter-node step 으로 줄인다 (§4.2 의 Tree latency 식).
+NCCL 의 SYS-path 기본 bw (0.1 GB/s) 가 매우 보수적인 lower bound 라 절대값은 실측과 큰 차이. **그러나 argmin 은 상대 순서만 보면 되므로 실용적 알고리즘 선택에는 영향 없음**. NVSwitch + NVLink 환경 (H100 / H200) 에서 같은 명령을 돌리면 NVLS / NVLSTree 가 살아나고 bw 가 100 ~ 900 GB/s 대로 들어가 Ring 을 밀어낸다 — methodology 는 동일.
 
-| $K$ | Ring | Tree (Double Binary) |
-|---|---|---|
-| 1 MB | $\sim 700$ µs | $\sim 100$ µs |
-| 16 MB | $\sim 2.5$ ms | $\sim 1.4$ ms |
-| 256 MB | $\sim 35$ ms | $\sim 22$ ms |
+### 7.4 Summit 실측 — Double Binary Tree 의 large-scale 효과
 
-작은 $K$ 에서 tree 가 7 배 가까이 빠르고, 큰 $K$ 에서도 Sanders trick 덕에 tree 가 ring 보다 우세. NCCL 이 multi-node AllReduce 에서 Tree 를 자주 고르는 이유.
-
-### 7.3 정리
-
-시나리오별 자동 선택 패턴.
-
-- **Single-node H100 NVSwitch**: 큰 AllReduce 는 NVLS, 작은 건 Tree 또는 NVLS.
-- **Multi-node IB**: 큰 AllReduce 는 Tree (Double Binary), 작은 건 Tree, AllGather/RS 는 Ring 또는 PAT (1-GPU/노드면).
-- **InfiniBand SHARP NIC**: CollNetDirect / Chain 이 Tree 를 밀어내는 경우.
-
-(plot placeholder) 위 표를 Python + matplotlib 로 그려 같은 axes 에 ring / tree / NVLS 곡선을 올리면 두 crossover 가 시각적으로 보인다. 시나리오 A 에서는 NVLS 가 항상 아래, 시나리오 B 에서는 small $K$ 의 tree 와 large $K$ 의 ring 사이 crossover.
-
-수치 분석은 그렇고, 실측은 어땠나. NCCL 2.4 의 Double Binary Tree 가 Summit 에서 24,576 GPU 까지 어떻게 scale 했는지 보자.
+위는 2-GPU 하한이고, scale-out 으로 가면 Double Binary Tree 의 가치가 드러난다. NVIDIA 의 Summit 측정.
 
 ![NCCL bus bandwidth on Summit, up to 24,576 GPUs](/assets/img/posts/nccl-algorithms/Summit-BW.png){: width="640"}
 _Figure 6. Summit 의 24K GPU 까지 거의 flat 한 bus bandwidth. Double Binary Tree + multi-channel ring 이 large-scale 에서도 bandwidth 를 유지한다._
@@ -612,18 +615,24 @@ NCCL_ALGO="ring,collnetdirect;allreduce:tree,collnetdirect"
 NCCL_PROTO="^LL128"
 ```
 
-코드 흐름은 `parseList` 가 bitmask 로 만들고, 비활성 셀의 bandwidth 를 0 으로 (`tuning.cc:504`). 위의 argmin 이 자동으로 그 셀을 거른다.
+코드 흐름은 `parseList` 가 bitmask 로 만들고, 비활성 셀의 bandwidth 를 0 으로. 위의 argmin 이 자동으로 그 셀을 거른다.
 
-### 8.2 Determinism
-
-Reduction tree 가 달라지면 부동소수점 덧셈 순서가 달라져 낮은 비트에서 차이.
+한 가지 함정. `NCCL_ALGO=Tree` 만 쓰면 Broadcast / Reduce / AllGather / ReduceScatter 가 깨진다 — Tree 는 AllReduce 만 eligible 한데 (`tuning.cc::ncclTopoTuneModel`), `NCCL_ALGO=Tree` 는 모든 collective 에 Tree 강제 + 다른 algorithm 비활성. 그 결과 Broadcast 등은 후보 셀이 모두 bw=0 으로 떨어진다. 안전한 형태:
 
 ```bash
-NCCL_ALGO=Tree
+NCCL_ALGO="ring;allreduce:tree"   # 다른 collective 는 Ring 으로 폴백
+```
+
+### 8.2 Reproducibility 보조 도구로서의 algo/proto 고정
+
+부동소수점 덧셈은 비결합적이라 reduction 순서가 바뀌면 낮은 비트에서 차이가 난다. NCCL 의 비결정성 주된 원인은 메시지 사이즈에 따라 algorithm 이 갈리는 것. 따라서
+
+```bash
+NCCL_ALGO="ring;allreduce:tree"
 NCCL_PROTO=Simple
 ```
 
-이 둘로 algorithm 과 protocol 을 고정하면 reduction 순서가 결정적이 된다. bf16 환경에서는 무시하기 어려운 차이를 줄 수 있어 reproducibility 검증 시 자주 쓴다.
+처럼 (algo, proto) 를 고정하면 그 안에서 reduction 순서가 안정화돼 **bitwise reproducible 에 가까워진다**. 다만 진짜 bitwise determinism 은 channel 수 / NCCL 버전 / topology / rank mapping 까지 같아야 보장되는 것이고, NCCL 자체에는 "deterministic" flag 가 없다는 점 유의. bf16 학습 시 reproducibility 검증할 때 자주 쓰는 trick.
 
 ### 8.3 NCCL_DEBUG_SUBSYS=TUNING
 
@@ -685,7 +694,7 @@ PyTorch profiler trace 의 kernel 이름도 같은 정보를 담는다. `ncclKer
 
 ## Reference
 
-- Hu, Z. et al. "Demystifying NCCL: An In-depth Analysis of GPU Communication Protocols and Algorithms." arXiv:2507.04786, 2026.
+- Hu, Z. et al. "Demystifying NCCL: An In-depth Analysis of GPU Communication Protocols and Algorithms." arXiv:2507.04786, 2025 (NCCL 2.19.1 기준; 본 글의 코드 인용은 NCCL v2.30 기준이라 일부 수치 / 분기가 다를 수 있음).
 - Sanders, P., Speck, J., Träff, J.L. "Full Bandwidth Broadcast, Reduction and Scan with Only Two Trees." PVM/MPI, 2007.
 - Thakur, R., Rabenseifner, R., Gropp, W. "Optimization of Collective Communication Operations in MPICH." IJHPCA, 2005.
 - Bruck, J. et al. "Efficient Algorithms for All-to-All Communications in Multiport Message-Passing Systems." IEEE TPDS, 1997.
