@@ -3,6 +3,7 @@ icon: fas fa-info-circle
 order: 4
 lang: ko
 ref: about
+permalink: /about/
 ---
 
 ML Sys Engineer.
