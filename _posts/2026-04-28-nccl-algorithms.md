@@ -12,7 +12,7 @@ mermaid: true
 
 This is a follow-up to [NCCL and Communication Collectives](/posts/nccl-collectives/).
 
-> Code references and function names follow NCCL master as of 2026-04 (v2.30).
+> **Version note.** Code references and line numbers are pinned to the [NVIDIA/nccl `v2.30.4-1` tag](https://github.com/NVIDIA/nccl/releases/tag/v2.30.4-1). `master` is a moving branch, so line numbers and some gating constants may drift over time. The §7 RTX 5060 Ti log was captured on **NCCL 2.28.9**, so treat it as an **observation methodology demo**, not a v2.30.4-1 cost-table validation. The only substantive changes between 2.28 and 2.30 are (a) relaxed LL128 enable for Hopper+ with mixed compcap, and (b) the Blackwell row of `perChMaxRingLL128Bws`. `NCCL_LL128_C2C` default (1), `baseLatencies`, `hwLatencies`, and `nvlsEfficiency` are identical across the two tags.
 
 ## 1. Same Collective, Different Schedule
 
@@ -28,7 +28,7 @@ The goal of this post is to follow how that table is built and how the host, giv
 
 ## 2. αβγ Cost Model
 
-A cost model is a way to express the time of one communication as a single formula. It does not give exact measurements, but it is the tool you use to compare algorithm A with algorithm B or to let a library like NCCL pick automatically. NCCL's cost model also reduces to one line in the end (`time = lat + bytes / bw`, see §6.4), and the algorithm-by-algorithm analysis in §4 of this post all sits on top of it.
+A cost model is a way to express the time of one communication as a single formula. It does not give exact measurements, but it is the tool you use to compare algorithm A with algorithm B or to let a library like NCCL pick automatically. NCCL's final per-call comparison reduces to one line, `time = lat·latCount + bytes / bw` (see §6.4) — but the `lat` and `bw` inputs to that one line are already shaped by topology search, protocol efficiency, algorithm-specific correction factors, and channel-count heuristics. The algorithm-by-algorithm analysis in §4 of this post all sits on top of that cost model.
 
 The standard form splits the time of a single message into three terms.
 
@@ -52,10 +52,27 @@ Before the §4 deep dive, here are the seven algorithms, six topology patterns, 
 ### 3.1 Seven Algorithms
 
 ```c
-// src/include/device.h
-const char* ncclAlgoStr[NCCL_NUM_ALGORITHMS] = {
-  "Tree", "Ring", "CollNetDirect", "CollNetChain", "NVLS", "NVLSTree", "PAT"
-};
+// src/init.cc:51-53 — three string-array definitions
+const char* ncclFuncStr[NCCL_NUM_FUNCTIONS]   = { "Broadcast", "Reduce", "AllGather", "ReduceScatter", "AllReduce" };
+const char* ncclAlgoStr[NCCL_NUM_ALGORITHMS] = { "Tree", "Ring", "CollNetDirect", "CollNetChain", "NVLS", "NVLSTree", "PAT" };
+const char* ncclProtoStr[NCCL_NUM_PROTOCOLS] = { "LL", "LL128", "Simple" };
+```
+
+`src/include/device.h` only holds the `extern` declarations; the actual definitions are in `src/init.cc`. The id constants themselves live in a plugin header as `#define`s, because tuner-plugin authors need to map algorithm and protocol numbers directly.
+
+```c
+// src/include/plugin/nccl_tuner.h:28-40 — algorithm / protocol ids
+#define NCCL_ALGO_TREE          0
+#define NCCL_ALGO_RING          1
+#define NCCL_ALGO_COLLNET_DIRECT 2
+#define NCCL_ALGO_COLLNET_CHAIN 3
+#define NCCL_ALGO_NVLS          4
+#define NCCL_ALGO_NVLS_TREE     5
+#define NCCL_ALGO_PAT           6
+
+#define NCCL_PROTO_LL           0
+#define NCCL_PROTO_LL128        1
+#define NCCL_PROTO_SIMPLE       2
 ```
 
 | Algorithm | Core structure | Applicable collectives | Notes |
@@ -216,7 +233,7 @@ _Figure 5. NCCL's PAT algorithm at 8 ranks. The Bruck binomial tree pattern, shi
 
 #### 4.3.1 Narrow Enable Conditions
 
-Why PAT is rarely seen. `ncclPatEnable` (`src/graph/tuning.cc`, NCCL v2.30) requires three conditions all at once.
+Why PAT is rarely seen. `ncclPatEnable` (`src/graph/tuning.cc`) requires three conditions all at once.
 
 ```c
 // src/graph/tuning.cc
@@ -312,9 +329,28 @@ Conditions.
 - Hopper / Blackwell GPU (compcap 9.0 / 10.0).
 - NVSwitch in the system (`system->nodes[NVS].count > 0`).
 - At least 2 channels.
-- **Single node: `NVLS` only** (`NVLS_TREE` is auto-disabled when `comm->nNodes == 1`).
+- Simple protocol only. `tuning.cc:288` (`if ((a == NCCL_ALGO_NVLS || a == NCCL_ALGO_NVLS_TREE) && p != NCCL_PROTO_SIMPLE) continue;`) skips LL and LL128 cells during bandwidth-table construction.
+- **Single node: `NVLS` only** (`NVLS_TREE` is auto-disabled when `comm->nNodes == 1`, `tuning.cc:474`).
 - **Multi-node + collnet enabled: both `NVLS` and `NVLS_TREE` survive**, and argmin picks based on message size.
 - **Multi-node + collnet disabled: `NVLS_TREE` only** (`NVLS` is auto-disabled on multi-node when collnet is off, `tuning.cc:476-479`).
+- **Dtype / reduction op also gate NVLS**. For every collective other than AllGather, the candidate must clear `ncclNvlsSupported` (`src/include/device.h:574-589`). The matrix is narrow:
+
+```cpp
+// src/include/device.h:574-589
+inline bool ncclNvlsSupported(int devRedOp, int type) {
+  switch (type) {
+  case ncclInt32: case ncclUint32: case ncclInt64: case ncclUint64:
+  case ncclFloat16: case ncclBfloat16:
+    return devRedOp == ncclDevSum || devRedOp == ncclDevMinMax;
+  case ncclFloat: case ncclDouble:
+    return devRedOp == ncclDevSum;
+  default:
+    return false;
+  }
+}
+```
+
+So int32/uint32/int64/uint64/fp16/bf16 allow sum/min/max, fp32 and double allow **sum only**, and everything else (fp8, etc.) is rejected outright. Sum-based training workloads typically see NVLS as a strong candidate, but prod-reduction or fp8 mixed-precision variants drop NVLS even on a fully-NVSwitched box.
 
 The cost expressions:
 
@@ -335,7 +371,7 @@ NVLS: `α × 1` (intra) plus optionally `α × 1` (inter). The $p$ falls out of 
 Uses InfiniBand SHARP (Scalable Hierarchical Aggregation and Reduction Protocol). The NIC and IB switch handle reduce in hardware.
 
 ```c
-// src/graph/tuning.cc
+// src/graph/tuning.cc — latency expressions
 } else if (a == NCCL_ALGO_COLLNET_DIRECT) {
   comm->latencies[coll][a][p] +=
     2 * (std::min(1, (nRanks/nNodes-1)) * intraLat + (nRanks/nNodes-1) * 0.4) + interLat;
@@ -344,7 +380,50 @@ Uses InfiniBand SHARP (Scalable Hierarchical Aggregation and Reduction Protocol)
 }
 ```
 
-Inter-node cost is `interLat × 1`, just one charge, because the inter-node reduction finishes inside the switch. The condition is hardware that supports SHARP and an IB SHARP NIC that NCCL recognizes. Used in HPC clusters with InfiniBand. In RoCE or NVLink environments, NVLS gets picked more often.
+Inter-node cost is `interLat × 1`, just one charge, because the inter-node reduction finishes inside the switch.
+
+The actual eligibility is far stricter than "you have a SHARP NIC." Reading `tuning.cc` in source order:
+
+```c
+// src/graph/tuning.cc:282-284 — CHAIN is excluded from AG/RS upfront
+if ((coll == ncclFuncReduceScatter || coll == ncclFuncAllGather)
+    && a != NCCL_ALGO_PAT && a != NCCL_ALGO_RING
+    && a != NCCL_ALGO_NVLS && a != NCCL_ALGO_COLLNET_DIRECT) continue;
+
+// src/graph/tuning.cc:334-350 — multi-node AG/RS requires plugin support
+if ((a == NCCL_ALGO_NVLS || a == NCCL_ALGO_COLLNET_DIRECT) && p == NCCL_PROTO_SIMPLE
+    && (coll == ncclFuncAllGather || coll == ncclFuncReduceScatter) && comm->nNodes > 1) {
+  if (coll == ncclFuncAllGather   && (!comm->ncclCollNet || !comm->ncclCollNet->iallgather))   busBw = 0.0f;
+  if (coll == ncclFuncReduceScatter && (!comm->ncclCollNet || !comm->ncclCollNet->ireducescatter)) busBw = 0.0f;
+  if (comm->config.collnetEnable) nHeads = comm->collNetHeadsNum;
+  else busBw = 0.0f;
+  // any node where localRanks exceeds nHeads zeros busBw
+  for (int r = 0; r < comm->nRanks; r++) {
+    int node = comm->rankToNode[r];
+    if (comm->nodeRanks[node].localRanks > nHeads) { busBw = 0.0f; break; }
+  }
+}
+
+// src/graph/tuning.cc:476-479 — collnetEnable master switch
+if (comm->config.collnetEnable == 0 &&
+    (a == NCCL_ALGO_COLLNET_DIRECT ||
+     a == NCCL_ALGO_COLLNET_CHAIN ||
+     (a == NCCL_ALGO_NVLS && comm->nNodes > 1))) disable = 1;
+
+// src/graph/tuning.cc:481 — no NVSwitch disables COLLNET_DIRECT only (CHAIN survives)
+if (nvsCount == 0 && a == NCCL_ALGO_COLLNET_DIRECT) disable = 1;
+```
+
+Reading the four gates:
+
+- **CollNetChain is AllReduce-only.** It's already filtered out of AG/RS by the `continue` at `:282-284`.
+- **`collnetEnable=0` disables both CollNet algos** plus multi-node NVLS at the same time.
+- **CollNetDirect requires NVSwitch.** Without it (`nvsCount == 0`), it's disabled.
+- **Multi-node AG/RS CollNetDirect** further needs the plugin to register `iallgather` / `ireducescatter`, and every node's `localRanks ≤ collNetHeadsNum`.
+
+So it's not "SHARP present, you're done"; it's "NCCL agrees on the CollNet transport, the plugin functions, NVSwitch, and the head count." Worth picking in HPC InfiniBand SHARP environments. In RoCE or pure-NVLink boxes, NVLS tends to win.
+
+> Direct vs. Chain. Direct is a fan-in layout where every GPU in a node bundles into a head NIC, so the intra-node leaf reduce finishes in one hop (the `min(1, p_node-1)·intraLat` term). Chain serializes the intra-node reduce along a GPU chain before the head goes inter, so intra latency is `(p_node-1)·intraLat` linear. On NVSwitched nodes, Direct almost always wins; on PCIe-only nodes with no NVSwitch, only Chain remains.
 
 ## 5. Protocols Simple / LL / LL128
 
@@ -372,28 +451,33 @@ struct ProtoLL128 {   // NCCL_PROTO_LL128 = 1
 };
 ```
 
-LL128 only enables on transports with guaranteed atomicity. The conditions are involved (`src/graph/tuning.cc`, NCCL v2.30).
+LL128 only enables on transports with guaranteed atomicity. The conditions are involved (`src/graph/tuning.cc:488-502`).
 
 ```c
-// src/graph/tuning.cc, LL128 enable gating
+// src/graph/tuning.cc:229
+NCCL_PARAM(Ll128C2c, "LL128_C2C", 1);
+
+// src/graph/tuning.cc:488-502 — LL128 enable gating
 if (pEnable == 2 && p == NCCL_PROTO_LL128) {
   pEnable = 1;
   if (ncclParamLl128C2c() && minCompCap >= 90) {
-    pEnable &= (graphs[a]->typeInter <= PATH_PXN);  // Hopper+ with LL128_C2C=1 allows up to PXN
+    // Hopper+ defaults to allowing up to PATH_PXN (incl. C2C, PXN)
+    pEnable &= (graphs[a]->typeInter <= PATH_PXN);
   } else {
-    pEnable &= (graphs[a]->typeInter <= PATH_PXB);  // default cap is PXB
+    pEnable &= (graphs[a]->typeInter <= PATH_PXB);
   }
-  pEnable &= (graphs[a]->typeIntra <= PATH_NVB);    // intra-node must be NVLink only
+  pEnable &= (graphs[a]->typeIntra <= PATH_NVB);    // intra-node must be NVLink-class
   pEnable &= (minCompCap == maxCompCap || minCompCap >= 90);  // uniform compcap, or all >= Hopper
-  pEnable &= !(minCompCap < 70 || ...);
 }
 ```
 
-What that says.
+The default for `NCCL_LL128_C2C` is **1** (`tuning.cc:229`). This is not a flag the user has to opt into — it's already on, and setting `NCCL_LL128_C2C=0` narrows the inter-node cap to `PATH_PXB`. Reading the gating:
 
-- Intra-node has to be NVLink-Bridge or closer (so NVLink direct). PCIe path disables LL128.
-- Inter-node has to be PXB or closer (NIC on the same PCIe switch as the GPU). Hopper+ with `NCCL_LL128_C2C=1` extends this up to PXN.
+- Intra-node must be `PATH_NVB` or closer (NVLink direct). A PCIe-only intra path disables LL128.
+- Inter-node: (Hopper/Blackwell + `LL128_C2C`=default 1) → up to `PATH_PXN`. `LL128_C2C=0` or pre-Hopper → only up to `PATH_PXB`.
 - Compute capability is uniform across ranks, or all of them are at least Hopper.
+
+> One character was added to the last condition between v2.28 and v2.30. v2.28 required `(minCompCap == maxCompCap)`; v2.30 makes that `|| minCompCap >= 90`, so **mixed Hopper/Blackwell compcaps now enable LL128**. Everything else here (the `NCCL_LL128_C2C` default, the branch structure) is identical across the two tags.
 
 For the exact path types, see post 1 §4.5. From closest to farthest: NVL > NVB > C2C > PIX > PXB > P2C > PXN > PHB > SYS > NET.
 
@@ -401,9 +485,11 @@ For the exact path types, see post 1 §4.5. From closest to farthest: NVL > NVB 
 
 When a user calls a collective (e.g. `ncclAllReduce(buf, ..., count, dtype, op, comm, stream)`), the host has to pick which (algo, proto, nChannels, chunkSize) to launch with. The flow has two stages.
 
+> **Scope.** What follows describes NCCL's **built-in tuner**. With `NCCL_TUNER_PLUGIN`, the behavior changes: at `enqueue.cc:2051-2066`, NCCL first fills the built-in cost table, hands it to the plugin's `getCollInfo(..., float** collCostTable, ...)` as an **InOut** argument, lets the plugin edit it in place, and then runs the same `topoGetAlgoInfo` argmin on the modified table. External tuners therefore **re-rank/override** rather than fully replace. You don't even need to write a C plugin from scratch — NCCL's [`plugins/tuner/example/`](https://github.com/NVIDIA/nccl/tree/v2.30.4-1/plugins/tuner/example) ships a CSV-based override mechanism driven by `NCCL_TUNER_CONFIG_FILE` (which is parsed inside that example plugin, not in NCCL core).
+
 ### 6.1 Init: Build the α/β Table
 
-`ncclTopoTuneModel` (`src/graph/tuning.cc`, NCCL v2.30) fills two tables at communicator init time, one cell per (collective, algorithm, protocol).
+`ncclTopoTuneModel` (`src/graph/tuning.cc`) fills two tables at communicator init time, one cell per (collective, algorithm, protocol).
 
 - `comm->bandwidths[coll][algo][proto]` (GB/s)
 - `comm->latencies[coll][algo][proto]` (µs)
@@ -482,7 +568,7 @@ Disabled cells get `comm->bandwidths[c][a][p] = 0`. The argmin step later drops 
 
 ### 6.4 Per-call Argmin
 
-When a user calls `ncclAllReduce(...)`, a collective task is created and `topoGetAlgoInfo` (`src/enqueue.cc`, NCCL v2.30) takes the message size and group size and finds the argmin in the §1 7 x 3 table.
+When a user calls `ncclAllReduce(...)`, a collective task is created and `topoGetAlgoInfo` (`src/enqueue.cc`) takes the message size and group size and finds the argmin in the §1 7 x 3 table.
 
 ```c
 // src/enqueue.cc (excerpt)
@@ -507,14 +593,21 @@ for (int a=0; a<NCCL_NUM_ALGORITHMS; a++)
   }
 ```
 
-`ncclTopoGetAlgoTime` itself is one line.
+The **final line** of `ncclTopoGetAlgoTime` is one line.
 
 ```c
-// src/graph/tuning.cc (NCCL v2.30)
+// src/graph/tuning.cc:609
 *time = lat * latCount + nBytes / (1000 * bw);
 ```
 
-$T = (\text{lat} \times \text{latCount}) + \frac{\text{nBytes}}{1000 \times \text{bw}}$. NCCL's implementation of $\alpha + n\beta$. `latCount` differs per algorithm (Ring uses `numPipeOps`, others use `DIVUP(numPipeOps, NCCL_MAX_DEV_WORK_BATCH_COLLS)`), and Tree AllReduce gets a per-message-size correction (`treeCorrectionFactor[protocol][logSize]`).
+$T = (\text{lat} \times \text{latCount}) + \frac{\text{nBytes}}{1000 \times \text{bw}}$ — NCCL's implementation of $\alpha + n\beta$. But the `lat` and `bw` feeding that one line are heuristic stack-ups (`tuning.cc:312-329`, `:601-605`):
+
+- **bw corrections** (inside `ncclTopoTuneModel`): Ring LL `× 0.5` capped at `llMaxBw`, Ring LL128 `× 0.92` capped, Tree+AllReduce `× 0.92`, Tree LL `× 1/3.8`, Tree LL128 `× 7/9` (single node) or `× 120/128` (multi-node), Tree `NCCL_TOPO_PATTERN_TREE` extra `× 0.85`, PAT `× 0.75`, CollnetDirect Simple+Hopper `× 0.85`.
+- **Further bw correction** (inside `ncclTopoGetAlgoTime`): Tree AllReduce and NVLS_TREE (Blackwell+x86) hit one more size-dependent `treeCorrectionFactor[protocol][logSize]` table.
+- **lat correction**: Ring + Simple + multi-node + AllReduce + chunk ≥ 64 B gets `lat *= (minCompCap < 80 ? 1.9 : 1.4)` — the "Ring plateau" correction (`tuning.cc:603-605`).
+- **latCount**: Ring uses `numPipeOps`, every other algorithm uses `DIVUP(numPipeOps, NCCL_MAX_DEV_WORK_BATCH_COLLS)`.
+
+The single-line formula sits on top of those corrections. "One line" describes the final shape, not the table itself — every cell of the table was filled by a different per-(algo, proto) expression.
 
 ### 6.5 Channel and Chunk Size
 
@@ -540,7 +633,11 @@ This is the full host-side flow that turns a tensor size into an algorithm and p
 
 ## 7. Watching It Live with NCCL_DEBUG_SUBSYS=TUNING
 
-Reading NCCL's own log is faster than calculating from the model when you want to know what table the §6 selection machine actually builds and which cell it picks. On a 2x RTX 5060 Ti box (consumer GPU, P2P disabled, SHM transport, NCCL 2.28.9), the four lines below get §6.1's init table and §6.4's dispatch printed verbatim.
+Reading NCCL's own log is faster than calculating from the model when you want to know what table the §6 selection machine actually builds and which cell it picks.
+
+> **Scope of this section.** The log below is **not** a reproduction of the v2.30.4-1 cost table. The environment is 2x RTX 5060 Ti (consumer GPU, P2P disabled, SHM transport, **NCCL 2.28.9**) — a minor version off from the v2.30.4-1 code cited throughout this post. The same hardware can produce different tables and dispatch decisions depending on NCCL version, CUDA version, P2P settings, driver, and rank mapping. The point here is not to validate the absolute numbers in NCCL's cost model but to show how to **observe** what survives the eligibility filter and what gets dispatched, via `NCCL_DEBUG_SUBSYS=TUNING`.
+
+The four lines below get §6.1's init table and §6.4's dispatch printed verbatim.
 
 ```bash
 export NCCL_DEBUG=INFO
@@ -587,7 +684,7 @@ Ring Simple at every size. The surviving candidates were Ring LL (lat 8.6 µs) a
 | 16 MiB | **1.38 ms** | $\approx 168$ ms |
 | 256 MiB | **20.7 ms** | $\approx 2.7$ s |
 
-NCCL's SYS-path default bw (0.1 GB/s) is a very conservative lower bound, so the absolute values diverge from measurement by orders of magnitude. **What matters is that argmin only needs the relative ordering, so practical algorithm selection still works**. On NVSwitch + NVLink (H100 / H200), the same command brings NVLS / NVLSTree alive and bw lands in the 100–900 GB/s range, pushing Ring out — methodology unchanged.
+NCCL's SYS-path default bw (0.1 GB/s) is a very conservative lower bound, so the absolute values diverge from measurement by orders of magnitude. In this particular example the surviving candidates are essentially just Ring LL and Ring Simple, so the SYS-path bandwidth estimate's absolute error never changed the final pick — it just happens to not matter here. In environments with many candidates (NVLink/NVSwitch/IB), the same cost-model correction error can flip the choice at boundary message sizes. On NVSwitch + NVLink (H100 / H200), the same command brings NVLS / NVLSTree alive and bw lands in the 100–900 GB/s range, pushing Ring out — methodology unchanged.
 
 ### 7.4 Summit Measurements: Double Binary Tree at Large Scale
 
@@ -672,20 +769,32 @@ PyTorch profiler trace kernel names carry the same information: `ncclKernel_AllR
 
 ## NCCL Source
 
+Pinned to the v2.30.4-1 tag.
+
 | Topic | File | Function / region |
 |---|---|---|
-| Algorithm enum | `src/include/device.h` | `ncclAlgoStr[]` |
-| Pattern enum | `src/include/graph.h` | `NCCL_TOPO_PATTERN_*` |
+| Algorithm / Func / Proto strings | `src/init.cc:51-53` | `ncclFuncStr`, `ncclAlgoStr`, `ncclProtoStr` |
+| Algorithm / Protocol ids | `src/include/plugin/nccl_tuner.h:28-40` | `NCCL_ALGO_*`, `NCCL_PROTO_*` (#define) |
+| Device-side extern declarations | `src/include/device.h` | `extern const char* ncclAlgoStr[]` etc. |
+| Topology pattern | `src/include/graph.h` | `NCCL_TOPO_PATTERN_*` |
+| PATH types | `src/include/graph.h:110-146` | `PATH_*` (#define, LOC..DIS) |
 | Ring construction | `src/graph/rings.cc` | `ncclBuildRings` |
 | Double Binary Tree construction | `src/graph/trees.cc` | `ncclGetDtree`, `ncclGetBtree` |
 | Topology pattern search | `src/graph/search.cc` | `ncclTopoCompute` |
 | Build α/β tables | `src/graph/tuning.cc` | `ncclTopoTuneModel` |
-| baseLat / hwLat | `src/graph/tuning.cc` | `baseLatencies`, `hwLatencies` |
+| baseLat / hwLat | `src/graph/tuning.cc:145-170` | `baseLatencies`, `hwLatencies` |
 | NVLS efficiency | `src/graph/tuning.cc` | `nvlsEfficiency` |
-| LL128 enable | `src/graph/tuning.cc` | `pEnable` block |
+| NVLS dtype/op gating | `src/include/device.h:574-589` | `ncclNvlsSupported` |
+| LL128 enable | `src/graph/tuning.cc:488-502` | `pEnable` block |
+| `NCCL_LL128_C2C` default | `src/graph/tuning.cc:229` | `NCCL_PARAM(Ll128C2c, "LL128_C2C", 1)` |
+| CollNet gating | `src/graph/tuning.cc:282-350, 476-481` | collnetEnable, nvsCount, plugin support |
 | PAT enable | `src/graph/tuning.cc` | `ncclPatEnable` |
-| Cost model formula | `src/graph/tuning.cc` | `ncclTopoGetAlgoTime` |
+| Cost model final line | `src/graph/tuning.cc:601-609` | `ncclTopoGetAlgoTime` |
+| bw / lat corrections | `src/graph/tuning.cc:312-329, 601-605` | Ring/Tree/PAT/CollnetDirect corrections + Ring plateau |
 | Argmin selection | `src/enqueue.cc` | `topoGetAlgoInfo` |
+| External tuner hook | `src/enqueue.cc:2051-2066` | `comm->tuner->getCollInfo` (InOut cost table) |
+| `NCCL_TUNER_PLUGIN` parse | `src/plugin/tuner.cc:58` | `ncclGetEnv("NCCL_TUNER_PLUGIN")` |
+| CSV-based tuner example | `plugins/tuner/example/` | `NCCL_TUNER_CONFIG_FILE` (parsed inside plugin) |
 | Tuning log line | `src/enqueue.cc` | `INFO(NCCL_TUNING, ...)` |
 | PAT AllGather kernel | `src/device/all_gather.h` | `RunWorkColl<NCCL_ALGO_PAT>` |
 | PAT ReduceScatter kernel | `src/device/reduce_scatter.h` | same structure |
@@ -694,7 +803,7 @@ PyTorch profiler trace kernel names carry the same information: `ncclKernel_AllR
 
 ## Reference
 
-- Hu, Z. et al. "Demystifying NCCL: An In-depth Analysis of GPU Communication Protocols and Algorithms." arXiv:2507.04786, 2025 (analyzes NCCL 2.19.1; this post cites NCCL v2.30 source, so some constants and branches differ).
+- Hu, Z. et al. "Demystifying NCCL: An In-depth Analysis of GPU Communication Protocols and Algorithms." arXiv:2507.04786, 2025 (analyzes NCCL 2.19.1; this post cites NCCL v2.30.4-1 source, so some constants and branches differ).
 - Sanders, P., Speck, J., Träff, J.L. "Full Bandwidth Broadcast, Reduction and Scan with Only Two Trees." PVM/MPI, 2007.
 - Thakur, R., Rabenseifner, R., Gropp, W. "Optimization of Collective Communication Operations in MPICH." IJHPCA, 2005.
 - Bruck, J. et al. "Efficient Algorithms for All-to-All Communications in Multiport Message-Passing Systems." IEEE TPDS, 1997.
